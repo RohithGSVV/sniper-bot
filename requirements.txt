@@ -1,0 +1,4 @@
+robin_stocks==3.4.0
+telethon==1.45.0
+python-dotenv
+tzdata

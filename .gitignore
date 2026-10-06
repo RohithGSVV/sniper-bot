@@ -1,0 +1,19 @@
+# secrets and logins: NEVER commit these
+.env
+data/
+*.session
+*.session-journal
+*.pickle
+
+# each day's logs and anything moved aside by the migration
+runs/
+legacy/
+
+# local clutter
+STOP_TRADING
+venv/
+.venv/
+__pycache__/
+*.pyc
+.mypy_cache/
+.vscode/
