@@ -9,9 +9,10 @@ size and total money at risk. It ignores shares, cash-secured puts, covered call
 
 ## What it does
 - Reads alerts live from Telegram (Telethon) and understands his formats, typos and corrections.
-- Checks the real quote on Robinhood before every buy; skips wide spreads, stale alerts, prices far from his.
-- Late entry (up to 10 min), watch-and-buy for options more than 3 days out (up to 60 min), take-profit at +40%,
-  emergency stop at -50%, expiry-day close at 3:30 PM.
+- Checks the real quote on Robinhood before every buy; skips wide spreads (after a 60 s re-check), stale alerts,
+  prices far from his, and a second contract on a stock it already holds.
+- Late entry by expiry (0DTE 10 min, 1-7 days 2 min, swings 60 min if he hasn't sold), watch-and-buy for options
+  more than 3 days out (up to 60 min), take-profit at +40%, emergency stop at -50%, expiry-day close at 3:30 PM.
 - A hard **project pot** (default $5,000): when it is lost, buying stops for good.
 - Always runs a **paper mode** (logs only) unless `LIVE_TRADING=true`.
 - Records the price path of every contract he buys, for later analysis.

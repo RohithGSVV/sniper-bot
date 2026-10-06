@@ -174,8 +174,17 @@ class Settings:
         self.max_buys_per_day = int(_env("MAX_BUYS_PER_DAY", 6))
         # sell as soon as the bid is more than this % above what we paid (0 = off)
         self.take_profit_pct = float(_env("TAKE_PROFIT_PCT", 40))
-        # late entry: a buy alert is still acted on up to this many minutes after he posts it
+        # late entry: a buy alert is still acted on up to this many minutes after he posts it, by expiry:
+        # 0DTE uses LATE_ENTRY_MIN; short-dated (1-7 days) LATE_ENTRY_MIN_SHORT; swing (8+ days)
+        # LATE_ENTRY_MIN_SWING, and a late swing is only bought while he hasn't sold any of it
         self.late_entry_min = float(_env("LATE_ENTRY_MIN", 10))
+        self.late_entry_min_short = float(_env("LATE_ENTRY_MIN_SHORT", 2))
+        self.late_entry_min_swing = float(_env("LATE_ENTRY_MIN_SWING", 60))
+        # a spread wider than MAX_SPREAD_PCT when he posts is re-checked for this many seconds before
+        # the buy is skipped (it is often a one-quote blip) (0 = off)
+        self.spread_recheck_sec = float(_env("SPREAD_RECHECK_SEC", 60))
+        # never hold two of his contracts on the same stock at once (e.g. MU 1100C and MU 1130C)
+        self.one_position_per_stock = _env("ONE_POSITION_PER_STOCK", "true").lower() == "true"
         # watch-and-buy: when the ask is above our cap at the alert (his price +ENTRY_CAP_PCT) and the
         # option expires MORE than WATCH_MIN_DTE days out, keep checking for WATCH_MIN minutes and buy if
         # the ask comes back within the cap - unless he sells first (0 = off)
@@ -1097,17 +1106,33 @@ class Engine:
             return skip("too late on expiry day")
         if a.exp < now.date():
             return skip("already expired")
-        age_limit = max(self.s.max_alert_age_sec, self.s.late_entry_min * 60)
+        bucket = row["bucket"]
+        age_limit = self._late_limit_sec(bucket)
         if not from_watch and delay > age_limit:
-            return skip(f"alert is {delay:.0f}s old (limit {age_limit:.0f}s)")
+            return skip(f"alert is {delay:.0f}s old (limit {age_limit:.0f}s for {bucket})")
+        late_swing = bucket == "swing" and delay > self.s.max_alert_age_sec
+        if late_swing and self.tracker:
+            t = self.tracker.items.get(key)
+            if t and Fraction(t.his_sold) > 0:
+                return skip(f"late entry, but he has already sold {t.his_sold} of it")
         if any(p.contract == a.contract and p.qty_open > 0 for p in self.positions):
             return skip("already holding this contract")
+        if self.s.one_position_per_stock:
+            same = [p for p in self.positions if p.ticker == a.ticker and p.qty_open > 0]
+            if same:
+                return skip(f"already holding {same[0].contract} - one position per stock", transient=True)
         if len([p for p in self.positions if p.qty_open > 0]) >= self.s.max_open_positions:
             return skip(f"max {self.s.max_open_positions} open positions", transient=True)
         if self.realized_today() <= -self.s.daily_loss_limit:
             return skip("daily loss limit hit")
         if self.buys_today() >= self.s.max_buys_per_day:
             return skip(f"already made {self.s.max_buys_per_day} buys today (MAX_BUYS_PER_DAY)")
+        if late_swing and not from_watch:
+            # An alert this late came in a burst (bot asleep or offline), with any sell he posted queued right
+            # behind it: look again in a few seconds instead of buying now. His sell ends the watch.
+            return self._start_watch(a, alert_time, key, row, f"alert arrived {_ago(delay)} late",
+                                     until=alert_time + timedelta(minutes=self.s.late_entry_min_swing),
+                                     first_check=now + timedelta(seconds=15))
 
         q = self.quotes(a.ticker, a.exp, a.strike, a.cp)
         if not q or not q.get("ask") or not q.get("bid"):
@@ -1119,10 +1144,15 @@ class Engine:
 
         cap = round(a.price * (1 + self.s.entry_cap_pct / 100), 2)
         if spread_pct > self.s.max_spread_pct:
-            return skip(f"spread {spread_pct:.0f}% > {self.s.max_spread_pct:g}%", transient=True)
+            why = f"spread {spread_pct:.0f}% > {self.s.max_spread_pct:g}%"
+            if not from_watch and self.s.spread_recheck_sec > 0:
+                return self._start_watch(a, alert_time, key, row, why, kind="spread",
+                                         until=now + timedelta(seconds=self.s.spread_recheck_sec))
+            return skip(why, transient=True)
         if ask > cap:
             why = f"ask {ask} above cap {cap} (+{(ask / a.price - 1) * 100:.0f}% vs his {a.price})"
-            if not from_watch and self._can_watch(a, now):
+            # a new alert, or a spread re-check whose spread has narrowed but whose ask is above the cap
+            if self._can_watch(a, now) and (not from_watch or self.watching.get(key, {}).get("kind") == "spread"):
                 return self._start_watch(a, alert_time, key, row, why)
             return skip(why, transient=True)
         floor = a.price * (1 - self.s.entry_floor_pct / 100)
@@ -1167,18 +1197,35 @@ class Engine:
     def _can_watch(self, a: Alert, now):
         return self.s.watch_min > 0 and (a.exp - now.date()).days > self.s.watch_min_dte
 
-    def _start_watch(self, a: Alert, alert_time: datetime, key, row, why):
-        until = alert_time + timedelta(minutes=self.s.watch_min)
+    def _late_limit_sec(self, bucket):
+        """How long after he posts (seconds) a buy alert may still be acted on, by expiry bucket."""
+        mins = {"short": self.s.late_entry_min_short, "swing": self.s.late_entry_min_swing}.get(
+            bucket, self.s.late_entry_min)
+        return max(self.s.max_alert_age_sec, mins * 60)
+
+    def _start_watch(self, a: Alert, alert_time: datetime, key, row, why, kind="price", until=None, first_check=None):
+        """kind = price (ask above the cap: watch up to WATCH_MIN) | spread (spread too wide: re-check for
+        SPREAD_RECHECK_SEC). Either way every buy rule is checked again before buying, and his sell ends it."""
+        until = until or alert_time + timedelta(minutes=self.s.watch_min)
         self.watching[key] = {"raw": a.raw, "alert_time": alert_time.isoformat(timespec="seconds"),
                               "until": until.isoformat(timespec="seconds"), "tries": 0,
-                              "msg_id": self.ctx.get("msg_id", "")}
+                              "msg_id": self.ctx.get("msg_id", ""), "kind": kind,
+                              "not_before": first_check.isoformat(timespec="seconds") if first_check else ""}
         self.save_state()
-        reason = (f"{why}. WATCHING until {until:%H:%M} ({self.s.watch_min:g} min): buys if the ask comes back "
-                  f"within the cap, unless he sells first")
+        if kind == "spread":
+            reason = (f"{why}. RE-CHECKING for {self.s.spread_recheck_sec:g} s: buys if the spread narrows and "
+                      f"every other rule still passes, unless he sells first")
+            text = (f"RE-CHECKING {a.contract} (his {a.price}): {why}. Will buy if the spread narrows within "
+                    f"{self.s.spread_recheck_sec:g} s, unless he sells first.")
+        else:
+            mins = (until - alert_time).total_seconds() / 60
+            reason = (f"{why}. WATCHING until {until:%H:%M} ({mins:.0f} min after his alert): buys once the ask "
+                      f"is within the cap, unless he sells first")
+            text = (f"WATCHING {a.contract} (his {a.price}): {why}. Will buy once the ask is within the cap, "
+                    f"before {until:%H:%M}, unless he sells first.")
         row.update(decision="WATCH", reason=reason)
         self.log(row)
-        self.notify(f"WATCHING {a.contract} (his {a.price}): {why}. Will buy if the ask drops back within the cap "
-                    f"before {until:%H:%M}, unless he sells first.")
+        self.notify(text)
         return ("WATCH", a.contract, reason)
 
     def _end_watch(self, key, why, log_row=True):
@@ -1202,11 +1249,20 @@ class Engine:
         self._last_watch = now
         for key, rec in list(self.watching.items()):
             alert_time = datetime.fromisoformat(rec["alert_time"])
-            if now >= datetime.fromisoformat(rec["until"]):
-                self._end_watch(key, f"{self.s.watch_min:g} minutes passed and the ask never came back within the cap")
+            until = datetime.fromisoformat(rec["until"])
+            if now >= until:
+                if rec.get("kind") == "spread":
+                    why = (f"re-checked for {self.s.spread_recheck_sec:g} s and it never qualified "
+                           f"(last check: {rec.get('last') or 'spread still too wide'})")
+                else:
+                    why = (f"{(until - alert_time).total_seconds() / 60:.0f} minutes passed and it never qualified "
+                           f"(last check: {rec.get('last') or 'ask above the cap'})")
+                self._end_watch(key, why)
                 continue
             if not self.market_open(now):
                 self._end_watch(key, "market closed")
+                continue
+            if rec.get("not_before") and now < datetime.fromisoformat(rec["not_before"]):
                 continue
             alert, _ = parse_line(rec["raw"], alert_time.date())
             if alert is None:
@@ -1217,6 +1273,8 @@ class Engine:
             if res[0] in ("BOUGHT", "WOULD BUY"):
                 self.watching.pop(key, None)
                 self.save_state()
+            elif res[0] == "WAIT":
+                rec["last"] = res[2]
             elif res[0] == "NOT FILLED":
                 rec["tries"] = rec.get("tries", 0) + 1
                 if rec["tries"] >= self.s.watch_max_tries:
@@ -2336,6 +2394,7 @@ def selftest():
     selftest_exit_typos()
     selftest_live()
     selftest_watch()
+    selftest_entry_rules()
 
 
 class _FakeAPI:
@@ -2442,13 +2501,13 @@ def selftest_watch():
     def has(ticker):
         return any(p.ticker == ticker and p.qty_open > 0 for p in eng.positions)
 
-    # --- late entry: up to 10 minutes after his alert ------------------------------
+    # --- late entry, short-dated: up to 2 minutes after his alert (more in selftest_entry_rules) ---
     book["LAA"] = (2.0, 2.05)
-    r = feed("BOUGHT LAA 100C 10/16 2.0", age=5 * 60)
-    check("alert 5 min old is still bought", r[0][0] == "BOUGHT", str(r[0]))
+    r = feed("BOUGHT LAA 100C 10/9 2.0", age=90)
+    check("short-dated alert 90 s old is still bought", r[0][0] == "BOUGHT", str(r[0]))
     book["LAB"] = (2.0, 2.05)
-    r = feed("BOUGHT LAB 100C 10/16 2.0", age=11 * 60)
-    check("alert 11 min old is skipped", r[0][0] == "SKIP" and "old" in r[0][2], str(r[0]))
+    r = feed("BOUGHT LAB 100C 10/9 2.0", age=3 * 60)
+    check("short-dated alert 3 min old is skipped", r[0][0] == "SKIP" and "old" in r[0][2], str(r[0]))
     check("...and not watched (too old to start with)", not eng.watching)
 
     # --- watch-and-buy -------------------------------------------------------------
@@ -2586,6 +2645,149 @@ def selftest_watch():
     check("expired contract is labelled EXPIRED", any("MU 1075C" in l and "EXPIRED" in l for l in lines), str(lines))
     check("a live contract still says he is still in", any("ORCL" in l and "still in" in l for l in lines), str(lines))
     print("\n  all late-entry / watch checks passed")
+
+
+def selftest_entry_rules():
+    """Late entry by expiry (0DTE: LATE_ENTRY_MIN, short-dated: 2 min, swing: 60 min while he hasn't sold any),
+    re-checking a wide spread for 60 s instead of skipping, and one position per stock."""
+    import tempfile
+    print("\n\n========== entry rules: late entry by expiry, spread re-check, one per stock ==========")
+    tmp = tempfile.mkdtemp()
+    clock = {"t": datetime(2026, 10, 6, 10, 0, 0, tzinfo=ET)}
+    book, notes = {}, []
+    s = Settings()
+    s.max_deployed, s.max_open_positions, s.max_buys_per_day = 5000, 20, 50
+    s.max_single_contract_cost, s.project_capital = 1000, 5000
+
+    def quotes(ticker, exp, strike, cp):
+        b = book.get(ticker)
+        return {"bid": b[0], "ask": b[1], "mark": round((b[0] + b[1]) / 2, 3)} if b else None
+
+    api = _FakeAPI()
+    brk = Broker(api, s, lambda x: None, orders_csv=os.path.join(tmp, "orders.csv"), sleep=lambda x: None,
+                 now=lambda: clock["t"])
+    tr = Tracker(s, lambda items: {}, lambda tickers: {}, now=lambda: clock["t"],
+                 path_csv=os.path.join(tmp, "paths.csv"), save=lambda: None, notify=lambda x: None)
+    eng = Engine(s, quotes, lambda x: notes.append(x), now=lambda: clock["t"],
+                 log_path=os.path.join(tmp, "log.csv"), state_path=os.path.join(tmp, "s.json"),
+                 tracker=tr, broker=brk, armed=lambda: True, stop_file=os.path.join(tmp, "STOP_TRADING"))
+
+    def feed(text, age=2, source="live"):
+        clock["t"] += timedelta(seconds=3)
+        notes.clear()
+        return eng.handle_message(text, clock["t"] - timedelta(seconds=age), None, source)
+
+    def tick(sec=11):
+        clock["t"] += timedelta(seconds=sec)
+        notes.clear()
+        eng.tick()
+
+    def check(label, cond, detail=""):
+        print(f"  {'PASS' if cond else 'FAIL'}  {label}  {detail}")
+        assert cond, label
+
+    def has(ticker):
+        return any(p.ticker == ticker and p.qty_open > 0 for p in eng.positions)
+
+    # --- late entry by expiry -------------------------------------------------------------
+    book["ZDA"] = (2.0, 2.05)
+    r = feed("BOUGHT ZDA 100C 10/6 2.0", age=9 * 60)
+    check("0DTE alert 9 min old is still bought (LATE_ENTRY_MIN)", r[0][0] == "BOUGHT", str(r[0]))
+    book["ZDB"] = (2.0, 2.05)
+    r = feed("BOUGHT ZDB 100C 10/6 2.0", age=11 * 60)
+    check("0DTE alert 11 min old is skipped", r[0][0] == "SKIP" and "old" in r[0][2], str(r[0]))
+    book["SDA"] = (2.0, 2.05)
+    r = feed("BOUGHT SDA 100C 10/13 2.0", age=110)           # 7 days out: still short-dated
+    check("short-dated (7 days) alert 110 s old is bought", r[0][0] == "BOUGHT", str(r[0]))
+    book["SDB"] = (2.0, 2.05)
+    r = feed("BOUGHT SDB 100C 10/13 2.0", age=130)
+    check("short-dated alert 130 s old is skipped", r[0][0] == "SKIP" and "old" in r[0][2], str(r[0]))
+
+    n = len(api.placed)
+    book["SWA"] = (2.0, 2.05)
+    r = feed("BOUGHT SWA 100C 10/14 2.0", age=30 * 60)       # 8 days out: swing
+    check("swing alert 30 min old: re-checked first, not bought straight away",
+          r[0][0] == "WATCH" and not has("SWA") and len(api.placed) == n, str(r[0]))
+    tick(5)
+    check("...not before 15 s", not has("SWA"))
+    tick(11)
+    check("...then bought while the ask is within the cap", has("SWA") and not eng.watching, str(notes))
+    book["SWB"] = (2.0, 2.05)
+    r = feed("BOUGHT SWB 100C 10/14 2.0", age=61 * 60)
+    check("swing alert 61 min old is skipped", r[0][0] == "SKIP" and "old" in r[0][2], str(r[0]))
+
+    book["SWC"] = (2.0, 2.05)
+    feed("BOUGHT SWC 100C 10/14 2.0", age=20 * 60)
+    feed("SOLD 1/2 SWC 100C 10/14 2.6", age=5 * 60)          # his sell, queued right behind it
+    check("his sell arriving right behind a late swing ends the re-check", not eng.watching and not has("SWC"))
+    tick(30)
+    check("...and nothing is bought later", not has("SWC"))
+
+    book["SWD"] = (2.0, 2.05)
+    feed("BOUGHT SWD 100C 10/14 2.0", age=3 * 60 * 60, source="catch-up")   # seen late: tracked, not bought
+    feed("SOLD 1/2 SWD 100C 10/14 2.6")
+    r = feed("BOUGHT SWD 100C 10/14 2.0", age=10 * 60)
+    check("late swing he has already sold some of is skipped", r[0][0] == "SKIP" and "already sold" in r[0][2],
+          str(r[0]))
+    r = feed("BOUGHT SWD 100C 10/14 2.0")
+    check("...but the same alert on time is bought as usual", r[0][0] == "BOUGHT", str(r[0]))
+
+    # --- a wide spread is re-checked for 60 s ------------------------------------------------
+    n = len(api.placed)
+    book["SPA"] = (1.50, 2.05)                                 # his 2.0: spread 31%
+    r = feed("BOUGHT SPA 100C 10/9 2.0")
+    check("wide spread: re-checking instead of skipping",
+          r[0][0] == "WATCH" and "RE-CHECKING" in r[0][2] and len(api.placed) == n, str(r[0]))
+    tick()
+    check("still wide: keeps re-checking quietly", not has("SPA") and len(eng.watching) == 1 and not notes, str(notes))
+    book["SPA"] = (1.95, 2.05)
+    tick()
+    check("spread narrows -> bought", has("SPA") and not eng.watching, str(notes))
+
+    book["SPB"] = (1.50, 2.05)
+    feed("BOUGHT SPB 100C 10/9 2.0")
+    for _ in range(5):
+        tick()
+    check("still re-checking at 55 s", len(eng.watching) == 1 and not has("SPB"))
+    tick(10)
+    check("60 s of wide spread -> skipped, not bought", not eng.watching and not has("SPB"))
+    check("...and it says why", "never qualified" in " ".join(notes) and "spread" in " ".join(notes), str(notes))
+
+    book["SPC"] = (3.70, 5.10)                                 # his 3.90: spread 32% (the COHR case)
+    feed("BOUGHT SPC 100C 10/14 3.9")
+    book["SPC"] = (3.90, 4.30)                                 # spread fine now, but ask above the 4.29 cap
+    tick()
+    rec = eng.watching.get(contract_key("SPC", 100.0, "C", date(2026, 10, 14)), {})
+    check("narrowed but above the cap -> becomes a normal price watch", rec.get("kind") == "price"
+          and not has("SPC"), str(rec))
+    book["SPC"] = (3.80, 3.90)
+    tick()
+    check("...and buys when the ask is back within the cap", has("SPC") and not eng.watching, str(notes))
+
+    s.spread_recheck_sec = 0
+    book["SPD"] = (1.50, 2.05)
+    r = feed("BOUGHT SPD 100C 10/9 2.0")
+    check("SPREAD_RECHECK_SEC=0: plain SKIP", r[0][0] == "SKIP" and "spread" in r[0][2] and not eng.watching,
+          str(r[0]))
+    s.spread_recheck_sec = 60
+
+    # --- one position per stock -----------------------------------------------------------
+    book["ONE"] = (2.0, 2.05)
+    r = feed("BOUGHT ONE 100C 10/9 2.0")
+    check("first ONE contract bought", r[0][0] == "BOUGHT", str(r[0]))
+    r = feed("BOUGHT ONE 110C 10/9 2.0")
+    check("second ONE contract (other strike) skipped", r[0][0] == "SKIP" and "one position per stock" in r[0][2],
+          str(r[0]))
+    feed("ALL OUT ONE 100C 10/9 2.4")
+    r = feed("BOUGHT ONE 110C 10/9 2.0")
+    check("after the first is sold, another ONE contract can be bought", r[0][0] == "BOUGHT", str(r[0]))
+    s.one_position_per_stock = False
+    book["TWO"] = (2.0, 2.05)
+    feed("BOUGHT TWO 100C 10/9 2.0")
+    r = feed("BOUGHT TWO 110C 10/9 2.0")
+    check("ONE_POSITION_PER_STOCK=false: both bought", r[0][0] == "BOUGHT", str(r[0]))
+    s.one_position_per_stock = True
+    print("\n  all entry-rule checks passed")
 
 
 def selftest_live():
