@@ -24,6 +24,7 @@ Run:
 
 import asyncio
 import csv
+import functools
 import json
 import math
 import os
@@ -1606,6 +1607,11 @@ class Robinhood:
     def __init__(self, settings):
         import robin_stocks.robinhood as rh
         self.rh = rh
+        # robin_stocks sends its GET requests (quotes, order status, positions) with no timeout, so one
+        # stuck connection would freeze alerts, stops and exits together. Give every request a default;
+        # calls that pass their own (order posts use 16 s) keep theirs.
+        sess = rh.helper.SESSION
+        sess.request = functools.partial(sess.request, timeout=10)
         self.s = settings
         self._ids = {}
         self.watchlist_ok = False
@@ -1961,7 +1967,9 @@ async def list_chats():
 
 def protect_from_freezing():
     """Windows only. Two things freeze this program silently:
-      1. the PC going to sleep -> ask Windows to stay awake while we run;
+      1. the PC going to sleep -> ask Windows to keep the PC and the screen awake while we run
+         (on laptops with Modern Standby the screen timing out is what puts the PC to sleep,
+         so keeping only the system awake is not enough). Closing the lid still sleeps it;
       2. clicking/selecting text in an old-style console window, which pauses the
          program until a key is pressed -> switch that 'QuickEdit' behaviour off.
     Never raises; returns a short text saying what it did."""
@@ -1971,9 +1979,9 @@ def protect_from_freezing():
     try:
         import ctypes
         k32 = ctypes.windll.kernel32
-        ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
-        if k32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED):
-            done.append("PC kept awake while the bot runs")
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED, ES_DISPLAY_REQUIRED = 0x80000000, 0x00000001, 0x00000002
+        if k32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED):
+            done.append("PC and screen kept awake while the bot runs (closing the lid still sleeps it)")
         handle = k32.GetStdHandle(-10)                 # standard input
         mode = ctypes.c_uint32()
         if k32.GetConsoleMode(handle, ctypes.byref(mode)):
@@ -2979,14 +2987,15 @@ if __name__ == "__main__":
             stream.reconfigure(errors="replace")  # type: ignore[union-attr]
         except Exception:
             pass
+    if "--selftest" in sys.argv:
+        # before .env is loaded: the checks expect the default settings, not your own limits
+        selftest()
+        sys.exit(0)
     try:
         from dotenv import load_dotenv
         load_dotenv(os.path.join(HERE, ".env"))
     except ImportError:
         pass
-    if "--selftest" in sys.argv:
-        selftest()
-        sys.exit(0)
     refuse_old_layout()
     if "--list-chats" in sys.argv:
         asyncio.run(list_chats())
