@@ -48,7 +48,7 @@ python sniper_shadow.py --list-chats
 - It then prints your groups. Copy the number next to **Sniper Trades** into `TG_CHAT_ID` in `.env`.
 - Telegram will list the bot as a new device under Settings → Devices. That's expected.
 
-## 7. Each trading day (observation week: through Wed Oct 7)
+## 7. Each trading day
 Start it by about **9:15 AM**, from `D:\WorkSpace\sniper-bot` with the venv active:
 ```
 python .\sniper-bot\sniper_shadow.py

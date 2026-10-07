@@ -1,8 +1,8 @@
 # sniper-bot
 
 Copies a trader's **long option** alerts (calls and puts) from a Telegram group into a Robinhood account:
-buy the contract when he buys, sell it when he sells. One contract per alert, with hard limits on price,
-size and total money at risk. It ignores shares, cash-secured puts, covered calls and spreads.
+buy the contract when he buys, sell it when he sells. One contract per alert (two, with a runner, when both
+fit the per-trade limit), with hard limits on price, size and total money at risk. It ignores shares, cash-secured puts, covered calls and spreads.
 
 > **Unofficial and risky.** It uses `robin_stocks`, an unofficial Robinhood client that may break or breach
 > Robinhood's terms. Live mode places real orders with real money. Nothing here is financial advice.
@@ -29,7 +29,6 @@ data/                   the bot's memory and logins (git-ignored, never share)
   state.json            positions, the pot, price watches (state.json.bak is its spare copy)
   robinhood.pickle      saved Robinhood login
   sniper_session.session  saved Telegram login
-  live_armed.txt        written by --test-order; allows live orders for that day
 runs/<YYYY-MM-DD>/      one folder per trading day (git-ignored)
   trades_log.csv        every alert and what the bot decided
   price_paths.csv       price of every contract he bought, over time
@@ -46,7 +45,6 @@ pip install -r requirements.txt
 copy .env.example .env                   (then fill in)
 python sniper_shadow.py --selftest       (checks the logic, no logins)
 python sniper_shadow.py                  (start the bot, about 9:15 AM)
-python sniper_shadow.py --test-order "SPCX 172.5C 10/30"   (arms live orders for today)
 ```
 Details: `docs/SETUP.md` and `docs/LIVE.md`.
 

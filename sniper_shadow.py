@@ -1,25 +1,26 @@
 """
-Sniper alerts - SHADOW MODE (paper trading only)
-=================================================
+Sniper alerts bot - copies his long option alerts into Robinhood
+================================================================
 
 What it does
   1. Listens to the Sniper Trades Telegram group, live.
   2. Reads each alert (BOUGHT / SOLD 1/2 / ALL OUT ...).
   3. Pulls the real Robinhood bid/ask for that option at that moment.
-  4. Decides what the real bot WOULD do (buy? skip? how many? sell how many?)
-     using the guardrails in your .env file.
-  5. Logs every decision to trades_log.csv, posts a short note to your
-     Telegram "Saved Messages", and (optionally) adds the ticker to a
-     Robinhood watchlist so you can see it working in the app.
+  4. Decides what to do (buy? skip? how many? sell how many?) using the guardrails in your .env file.
+  5. LIVE_TRADING=true: places REAL limit orders (1 contract per alert, or 2 with a runner) and runs the
+     take-profit, runner and emergency stops itself. LIVE_TRADING=false (shadow mode): only logs what it
+     WOULD do and never sends an order.
+  6. Logs every decision to runs/<date>/trades_log.csv, posts a short note to your Telegram
+     "Saved Messages", and records the price path of every contract he buys.
 
 What it never does
-  It contains NO order-placing code. It only reads quotes, and the only
-  thing it changes on your Robinhood account is the test watchlist.
+  It never touches positions it didn't buy, and it never buys once the project pot is gone.
+  See README.md and docs/LIVE.md.
 
 Run:
   python sniper_shadow.py --list-chats   # first time: find the group id
-  python sniper_shadow.py                # run during market hours
-  python sniper_shadow.py --selftest     # check the alert reader, no logins
+  python sniper_shadow.py                # run during market hours (type LIVE when asked, in live mode)
+  python sniper_shadow.py --selftest     # check the logic with pretend quotes and orders, no logins
 """
 
 import asyncio
@@ -88,7 +89,7 @@ except Exception:          # no tzdata (typical on Windows) -> use the built-in 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Folder layout (see README.md):
 #   data/   the bot's memory and logins (never share, never commit): state.json, robinhood.pickle,
-#           sniper_session.session, live_armed.txt
+#           sniper_session.session
 #   runs/   one folder per trading day: trades_log.csv, price_paths.csv, orders_log.csv, stalls.csv
 DATA_DIR = os.path.join(HERE, "data")
 RUNS_DIR = os.path.join(HERE, "runs")
@@ -122,9 +123,8 @@ PATHS_CSV = lambda: run_file("price_paths.csv")         # price of every contrac
 ORDERS_CSV = lambda: run_file("orders_log.csv")         # every REAL order sent, live mode only (daily)
 STALLS_CSV = lambda: run_file("stalls.csv")             # any freeze longer than a minute (daily)
 STATE_JSON = os.path.join(DATA_DIR, "state.json")       # memory between restarts (positions, pot, watches)
-ARMED_FILE = os.path.join(DATA_DIR, "live_armed.txt")   # written by --test-order; lets live orders go out today
 STOP_FILE = os.path.join(HERE, "STOP_TRADING")          # create this file = no new buys (exits still work)
-OLD_LAYOUT_FILES = ["paper_positions.json", "robinhood.pickle", "sniper_session.session", "live_armed.txt",
+OLD_LAYOUT_FILES = ["paper_positions.json", "robinhood.pickle", "sniper_session.session",
                     "trades_log.csv", "price_paths.csv", "orders_log.csv", "stalls.csv"]
 
 _CSV_WAITING: dict[str, list] = {}      # rows that could not be written yet, by file
@@ -196,6 +196,10 @@ class Settings:
         # nearest (default): with 1 contract we sell once he has sold half or more
         self.partial_rounding = _env("PARTIAL_ROUNDING", "nearest").lower()
         self.contracts_per_trade = int(_env("CONTRACTS_PER_TRADE", 1))
+        # runner: buy 2 contracts when both fit within MAX_SINGLE_CONTRACT_COST (lottos: always 1). The first is
+        # sold at his first trim (or by the take-profit); the second, the runner, only when he is fully out - or
+        # if its mid price falls back to what we paid
+        self.keep_runner = _env("KEEP_RUNNER", "true").lower() == "true"
         # his red double-exclamation (or the word "lotto") marks a lotto; we only copy lottos
         # whose price is under this many dollars per share (2.50 = $250 per contract)
         self.lotto_max_price = float(_env("LOTTO_MAX_PRICE", 2.50))
@@ -224,7 +228,6 @@ class Settings:
         self.watch_max_tries = int(_env("WATCH_MAX_TRIES", 3))
         # ---- LIVE TRADING (everything below is ignored unless LIVE_TRADING=true) ----
         self.live_trading = _env("LIVE_TRADING", "false").lower() == "true"
-        self.live_require_daily_test = _env("LIVE_REQUIRE_DAILY_TEST", "true").lower() == "true"
         self.buy_timeout_sec = float(_env("BUY_TIMEOUT_SEC", 15))
         self.buy_cushion_ticks = int(_env("BUY_CUSHION_TICKS", 1))
         self.sell_attempt_sec = float(_env("SELL_ATTEMPT_SEC", 8))
@@ -443,10 +446,16 @@ class Position:
     exit_attempts: int = 0
     exit_refused: int = 0     # sell orders in a row that Robinhood refused outright
     exit_why: str = ""
+    runner: bool = False      # 2 contracts: 1 sold at his first trim, 1 (the runner) kept until he is fully out
 
     @property
     def contract(self):
         return f"{self.ticker} {self.strike:g}{self.cp} {date.fromisoformat(self.exp):%m/%d}"
+
+    @property
+    def runner_left(self):
+        """Only the runner is left: the first of the 2 contracts has been sold."""
+        return self.runner and 0 < self.qty_open < self.qty_orig
 
 
 LOTTO_RE = re.compile("‼|❗|!!|\\bLOTTOS?\\b", re.I)    # double red !, heavy !, "!!", the word lotto
@@ -717,7 +726,7 @@ def _ago(sec):
     return f"{sec:.0f} s" if sec < 120 else f"{sec / 60:.0f} min"
 
 
-def buy_message(verb, qty, contract, our_price, his_price, lotto=False, delay=None, watched=False):
+def buy_message(verb, qty, contract, our_price, his_price, lotto=False, delay=None, watched=False, runner=False):
     """A small card for Telegram: what we paid next to what he paid. First line is the title;
     the rest is a table meant for a monospaced font."""
     diff = (our_price / his_price - 1) * 100 if his_price else 0.0
@@ -728,6 +737,8 @@ def buy_message(verb, qty, contract, our_price, his_price, lotto=False, delay=No
              f" {'We paid':<10}{our_price:>8.2f}{diff:>+9.1f}%",
              f" {'He paid':<10}{his_price:>8.2f}",
              f" {'Cost':<10}{'$' + format(qty * our_price * 100, ',.0f'):>8}   ({qty} contract{'s' if qty != 1 else ''})"]
+    if runner:
+        lines.append(f" {'Plan':<10}1 sold at his first trim, 1 runner kept until he is fully out")
     if watched:
         lines.append(f" {'Timing':<10}bought after watching the price ({_ago(delay)} after his alert)")
     elif delay is not None and delay > 60:
@@ -771,9 +782,8 @@ class Engine:
 
     def __init__(self, settings, quotes, notify, now=lambda: datetime.now(ET),
                  log_path=LOG_CSV, state_path=STATE_JSON, watchlist=None, tracker=None,
-                 broker=None, armed=None, stop_file=STOP_FILE):
+                 broker=None, stop_file=STOP_FILE):
         self.broker = broker          # Broker (real orders) or None (paper only)
-        self.armed = armed or (lambda: False)   # live orders only go out while this returns True
         self.stop_file = stop_file
         self.halted = ""              # non-empty = no new buys (e.g. an order we could not confirm)
         self.lock = threading.RLock()  # alerts and the timer run in different threads
@@ -1163,8 +1173,6 @@ class Engine:
                 return skip(f"TRADING HALTED: {self.halted}")
             if self.project_over():
                 return skip(f"PROJECT ENDED: the ${self.s.project_capital:,.0f} of capital is gone")
-            if not self.armed():
-                return skip("LIVE NOT ARMED - run the test order first (python sniper_shadow.py --test-order ...)")
         if lotto and a.price >= self.s.lotto_max_price:
             return skip(f"lotto priced {a.price:g} - lottos only under {self.s.lotto_max_price:g}")
 
@@ -1244,9 +1252,15 @@ class Engine:
             return skip(f"lotto, but the ask {ask:g} is not under {self.s.lotto_max_price:g}", transient=True)
 
         cost_one = ask * 100
-        qty = self.s.contracts_per_trade            # fixed size for now: 1 contract per alert
+        qty = self.s.contracts_per_trade            # 1 contract per alert, or 2 with a runner (below)
         if cost_one > self.s.max_single_contract_cost:
             return skip(f"1 contract costs ${cost_one:.0f} > ${self.s.max_single_contract_cost:g} limit", transient=True)
+        # runner: 2 contracts when both fit within MAX_SINGLE_CONTRACT_COST and the other money limits (never a lotto)
+        runner = (self.s.keep_runner and qty == 1 and not lotto and 2 * cost_one <= self.s.max_single_contract_cost
+                  and self.deployed() + 2 * cost_one <= self.s.max_deployed
+                  and (not self.broker or 2 * cost_one <= self.capital_free()))
+        if runner:
+            qty = 2
         if self.deployed() + qty * cost_one > self.s.max_deployed:
             return skip(f"would exceed ${self.s.max_deployed:g} deployed", transient=True)
 
@@ -1255,18 +1269,19 @@ class Engine:
             if qty * cost_one > free:
                 return skip(f"project capital: ${free:,.0f} free (${self.capital_left():,.0f} left, rest is in open "
                             f"positions), this needs ${qty * cost_one:,.0f}", transient=True)
-            return self._buy_live(a, row, qty, ask, cap, lotto, skip)
+            return self._buy_live(a, row, qty, ask, cap, lotto, skip, runner)
 
         self.positions.append(Position(
             ticker=a.ticker, strike=a.strike, cp=a.cp, exp=a.exp.isoformat(),
             qty_orig=qty, qty_open=qty, entry_price=ask, his_entry=a.price,
-            opened_at=now.isoformat(timespec="seconds"), lotto=lotto))
+            opened_at=now.isoformat(timespec="seconds"), lotto=lotto, runner=runner))
         self.save_state()
         slip = (ask / a.price - 1) * 100
         row.update(decision="WOULD BUY", qty=qty, our_price=ask,
-                   reason=f"limit {cap}; paying {slip:+.1f}% vs his price" + ("; LOTTO" if lotto else ""))
+                   reason=f"limit {cap}; paying {slip:+.1f}% vs his price" + ("; LOTTO" if lotto else "")
+                          + ("; RUNNER" if runner else ""))
         self.log(row)
-        self.notify(buy_message("WOULD BUY", qty, a.contract, ask, a.price, lotto, delay, from_watch))
+        self.notify(buy_message("WOULD BUY", qty, a.contract, ask, a.price, lotto, delay, from_watch, runner))
         if self.watchlist:
             self.watchlist(a.ticker)
         return ("WOULD BUY", a.contract, qty, ask)
@@ -1371,7 +1386,7 @@ class Engine:
             self.inflight.remove(order_id)
         self.save_state()
 
-    def _buy_live(self, a: Alert, row: dict, qty: int, ask: float, cap: float, lotto: bool, skip):
+    def _buy_live(self, a: Alert, row: dict, qty: int, ask: float, cap: float, lotto: bool, skip, runner=False):
         """Place a REAL limit buy: ask plus a small cushion, never above our cap."""
         b = self.broker
         tick = b.tick_size(a.ticker, a.exp, a.strike, a.cp, ask)
@@ -1379,11 +1394,16 @@ class Engine:
         limit = round(min(round_to_tick(ask, tick, "up") + self.s.buy_cushion_ticks * tick, top), 2)
         if limit < ask - 1e-9:
             return skip(f"ask {ask} is above the cap {cap} once rounded to valid price steps", transient=True)
+        bp = b.buying_power()
+        cushion = 1 + self.s.min_buying_power_buffer_pct / 100
+        two = 2 * limit * 100
+        if runner and (two > self.s.max_single_contract_cost or two > self.capital_free()
+                       or (bp is not None and bp < two * cushion)):
+            qty, runner = 1, False          # at the limit price (a step above the ask) 2 no longer fit: buy 1
         need = limit * 100 * qty
         if need > self.capital_free():
             return skip(f"project capital: ${self.capital_free():,.0f} free, the order needs ${need:,.0f}", transient=True)
-        bp = b.buying_power()
-        if bp is not None and bp < need * (1 + self.s.min_buying_power_buffer_pct / 100):
+        if bp is not None and bp < need * cushion:
             return skip(f"not enough buying power (${bp:,.0f} available, ${need:,.0f} needed)", transient=True)
         res = b.buy(a.ticker, a.exp, a.strike, a.cp, qty, limit, on_order=self._track_order)
         if res.state == "unknown":
@@ -1399,18 +1419,20 @@ class Engine:
             self.notify(f"NOT FILLED: buy {a.contract} limit {limit} ({res.note or res.state}). No position taken.")
             return ("NOT FILLED", a.contract, res.state)
         fill = res.price or limit
+        runner = runner and res.qty == 2            # only 1 of the 2 filled: an ordinary 1-contract position
         self.positions.append(Position(
             ticker=a.ticker, strike=a.strike, cp=a.cp, exp=a.exp.isoformat(),
             qty_orig=res.qty, qty_open=res.qty, entry_price=fill, his_entry=a.price,
-            opened_at=self.now().isoformat(timespec="seconds"), real=True, lotto=lotto))
+            opened_at=self.now().isoformat(timespec="seconds"), real=True, lotto=lotto, runner=runner))
         self.save_state()
         slip = (fill / a.price - 1) * 100
         row.update(decision="BOUGHT", qty=res.qty, our_price=fill,
                    reason=f"LIVE order {res.order_id}: limit {limit}, filled {fill}; {slip:+.1f}% vs his price"
-                          + ("; LOTTO" if lotto else ""))
+                          + ("; LOTTO" if lotto else "") + ("; RUNNER" if runner else "")
+                          + (f"; only {res.qty} of {qty} filled" if res.qty < qty else ""))
         self.log(row)
         self.notify(buy_message("BOUGHT", res.qty, a.contract, fill, a.price, lotto,
-                                float(row.get("delay_sec") or 0), bool(row.get("_watched"))))
+                                float(row.get("delay_sec") or 0), bool(row.get("_watched")), runner))
         if self.watchlist:
             self.watchlist(a.ticker)
         return ("BOUGHT", a.contract, res.qty, fill)
@@ -1532,6 +1554,8 @@ class Engine:
         exact = target * pos.qty_orig
         if target == 1:
             want_sold = pos.qty_orig
+        elif pos.runner:
+            want_sold = 1          # the first contract goes at his first trim; the runner waits until he is fully out
         elif self.s.partial_rounding == "up":
             want_sold = math.ceil(exact)
         elif self.s.partial_rounding == "nearest":
@@ -1549,14 +1573,29 @@ class Engine:
 
         if to_sell <= 0:
             self.save_state()
+            if pos.runner_left:
+                row.update(decision="HOLD", reason=f"he has sold {target} - holding the runner until he is fully out"
+                           + (f"; {typo_note}" if typo_note else ""))
+                self.log(row)
+                self.notify(f"HOLD runner {pos.contract}: he sold {a.fraction} more. The runner is sold when he is "
+                            f"fully out, or if its mid falls back to your buy price {pos.entry_price:g}.")
+                return ("HOLD", pos.contract)
             row.update(decision="HOLD", reason=f"{target} of {pos.qty_orig} rounds to 0 more - holding"
                        + (f"; {typo_note}" if typo_note else ""))
             self.log(row)
             self.notify(f"HOLD {pos.contract}: he sold {a.fraction}, too small to split your {pos.qty_open}")
             return ("HOLD", pos.contract)
 
-        return self._close(pos, to_sell, row, his_price=a.price,
-                           why=("sold at the open (queued)" if from_queue else "") + (" " + typo_note if typo_note else ""))
+        why = ("sold at the open (queued)" if from_queue else "") + (" " + typo_note if typo_note else "")
+        if pos.runner and to_sell < pos.qty_open:
+            why = f"his first trim: 1 of 2 sold, runner kept {why}"
+        return self._close(pos, to_sell, row, his_price=a.price, why=why)
+
+    def _runner_kept(self, pos):
+        """Say so once the first of a runner's 2 contracts has been sold."""
+        if any(p is pos for p in self.positions) and pos.runner_left and not pos.exit_wanted:
+            self._notify(f"RUNNER kept: 1x {pos.contract}. It is sold when he is fully out, or if its mid falls back "
+                         f"to your buy price {pos.entry_price:g}.")
 
     def _close_live(self, pos, qty, row, his_price, why, q):
         """One attempt to sell for real. If it doesn't fill, the position stays flagged
@@ -1587,6 +1626,7 @@ class Engine:
             self.log(row)
             self._notify(sell_message("SOLD", res.qty, pos.contract, price, pos.entry_price, his_price,
                                       pos.his_entry, pnl, his, why, pos.qty_open))
+            self._runner_kept(pos)
             return ("SOLD", pos.contract, res.qty, price, round(pnl, 2))
         # not sold this time
         first = pos.exit_wanted == 0
@@ -1644,15 +1684,20 @@ class Engine:
                 self._close(pos, min(pos.exit_wanted, pos.qty_open), row, his_price=None, why=pos.exit_why)
 
     def check_stops(self, now):
-        """Two automatic exits, checked every ~10 s on each open position:
-        - take profit: the BID is more than TAKE_PROFIT_PCT above what we paid (a price we can really sell at);
+        """Automatic exits, checked every ~10 s on each open position:
+        - take profit: the BID is more than TAKE_PROFIT_PCT above what we paid (a price we can really sell at).
+          With a runner it sells only the first of the 2 contracts; the runner itself has no take-profit;
+        - runner stop: once only the runner is left, sell it if the MID falls back to what we paid;
         - disaster stop: the MID has fallen DISASTER_STOP_PCT below what we paid. He often posts no
           exit on losers, so without this a loser can ride to zero."""
         stop_pct, tp_pct = self.s.disaster_stop_pct, self.s.take_profit_pct
-        if (stop_pct <= 0 and tp_pct <= 0) or not self.market_open(now):
+        if not self.market_open(now):
             return
         for pos in list(self.positions):
             if pos.qty_open <= 0 or pos.exit_wanted:
+                continue
+            runner_left = pos.runner_left
+            if stop_pct <= 0 and tp_pct <= 0 and not runner_left:
                 continue
             last = self._stop_checked.get(pos.contract)
             if last and (now - last).total_seconds() < self.s.exit_check_sec:
@@ -1662,14 +1707,20 @@ class Engine:
             if not q:
                 continue
             bid = q.get("bid")
-            if tp_pct > 0 and bid and bid > pos.entry_price * (1 + tp_pct / 100):
+            if tp_pct > 0 and not runner_left and bid and bid > pos.entry_price * (1 + tp_pct / 100):
                 row = {"alert_time": "", "raw": "(take profit)", "action": "TAKE_PROFIT", "contract": pos.contract}
-                self._close(pos, pos.qty_open, row, his_price=None,
-                            why=f"take profit: bid {bid:g} is {(bid / pos.entry_price - 1) * 100:+.0f}% over our {pos.entry_price:g}")
+                why = f"take profit: bid {bid:g} is {(bid / pos.entry_price - 1) * 100:+.0f}% over our {pos.entry_price:g}"
+                self._close(pos, 1 if pos.runner else pos.qty_open, row, his_price=None,
+                            why=why + ("; 1 of 2 sold, runner kept" if pos.runner else ""))
                 continue
             ref = q.get("mark")
             if ref is None and bid is not None and q.get("ask") is not None:
                 ref = (bid + q["ask"]) / 2
+            if runner_left and ref is not None and ref <= pos.entry_price:
+                row = {"alert_time": "", "raw": "(runner stop)", "action": "RUNNER_STOP", "contract": pos.contract}
+                self._close(pos, pos.qty_open, row, his_price=None,
+                            why=f"runner stop: mid {ref:g} is back to our buy price {pos.entry_price:g}")
+                continue
             if stop_pct > 0 and ref is not None and ref <= pos.entry_price * (1 - stop_pct / 100):
                 row = {"alert_time": "", "raw": "(disaster stop)", "action": "STOP", "contract": pos.contract}
                 self._close(pos, pos.qty_open, row, his_price=None,
@@ -1698,6 +1749,7 @@ class Engine:
         self.log(row)
         self.notify(sell_message("WOULD SELL", qty, pos.contract, bid, pos.entry_price, his_price,
                                  pos.his_entry, pnl, his, why, pos.qty_open))
+        self._runner_kept(pos)
         return ("WOULD SELL", pos.contract, qty, bid, round(pnl, 2))
 
     # ---- things that run on a timer ----------------------------------------
@@ -2166,17 +2218,6 @@ def log_stall(start: datetime, end: datetime):
                 f"{(end - start).total_seconds() / 60:.1f}"])
 
 
-def live_is_armed(s, now=None):
-    """Live orders only go out on a day when --test-order has passed (it writes today's date)."""
-    if not s.live_require_daily_test:
-        return True
-    try:
-        with open(ARMED_FILE, encoding="utf-8") as f:
-            return f.read().strip() == (now or datetime.now(ET)).strftime("%Y-%m-%d")
-    except Exception:
-        return False
-
-
 def send_phone(s, text, pre=False):
     """Optional push alert through your own Telegram bot (Saved Messages never buzzes the phone)."""
     if not (s.tg_bot_token and s.tg_notify_chat):
@@ -2204,7 +2245,10 @@ async def run():
     print(protect_from_freezing())
     if s.live_trading:
         print("\n" + "=" * 70 + "\n LIVE TRADING IS ON: this run places REAL orders with your Robinhood money."
-              f"\n 1 contract per alert; lottos only under {s.lotto_max_price:g}; emergency stop at "
+              f"\n 1 contract per alert"
+              + (f" (2 with a runner when both cost up to ${s.max_single_contract_cost:,.0f}; lottos always 1)"
+                 if s.keep_runner else "")
+              + f"; lottos only under {s.lotto_max_price:g}; emergency stop at "
               f"-{s.disaster_stop_pct:g}%.\n Kill switch: create a file named STOP_TRADING in this folder.\n" + "=" * 70)
         if input("Type LIVE and press Enter to continue (anything else exits): ").strip() != "LIVE":
             sys.exit("Not confirmed - exiting.")
@@ -2243,16 +2287,12 @@ async def run():
     tracker = Tracker(s, rh.quote_many, rh.underlying_many, now=lambda: datetime.now(ET),
                       path_csv=PATHS_CSV, save=lambda: None, notify=notify)
     broker = Broker(rh, s, notify) if s.live_trading else None
-    engine = Engine(s, rh.quote, notify, watchlist=rh.add_to_watchlist, tracker=tracker,
-                    broker=broker, armed=lambda: live_is_armed(s))
+    engine = Engine(s, rh.quote, notify, watchlist=rh.add_to_watchlist, tracker=tracker, broker=broker)
     if broker:
         for msg in await asyncio.to_thread(engine.startup_live):
             notify(f"!! Start-up check: {msg}")
         bp = broker.buying_power()
-        notify(f"LIVE mode started. {engine.capital_line()}. Buying power: {'unknown' if bp is None else f'${bp:,.0f}'}. "
-               + ("ARMED for today." if live_is_armed(s) else
-                  "NOT ARMED: run  python sniper_shadow.py --test-order \"<one of his open contracts>\"  "
-                  "after 9:30 AM to arm it. Until then buys are skipped."))
+        notify(f"LIVE mode started. {engine.capital_line()}. Buying power: {'unknown' if bp is None else f'${bp:,.0f}'}.")
     status = {"last_alert": None, "down_since": None, "warned": False}
     errors = {"n": 0, "told_at": {}}
 
@@ -2374,7 +2414,7 @@ async def run():
                 if (now - last_beat).total_seconds() >= s.heartbeat_min * 60:
                     last_beat = now
                     la = status["last_alert"]
-                    mode = ("LIVE armed" if live_is_armed(s) else "LIVE NOT ARMED") if broker else "shadow"
+                    mode = "LIVE" if broker else "shadow"
                     held = len([p for p in engine.positions if p.qty_open > 0])
                     cap = f" | capital ${engine.capital_left():,.0f}" if broker else ""
                     print(f"[{now:%H:%M:%S}] alive | {mode} | holding {held}{cap} | Telegram "
@@ -2388,7 +2428,7 @@ async def run():
             except Exception as e:
                 report_error("the status report", e)
 
-    mode_txt = "LIVE MODE running - real orders once armed" if s.live_trading else "SHADOW MODE running - no real orders"
+    mode_txt = "LIVE MODE running - real orders" if s.live_trading else "SHADOW MODE running - no real orders"
     print(f"\n{mode_txt}. Listening to chat {chat_id}. Ctrl+C to stop.\n")
     await catch_up()
     asyncio.create_task(timer())
@@ -2396,73 +2436,6 @@ async def run():
         await client.run_until_disconnected()
     finally:
         print("\n" + engine.summary())
-
-
-def test_order(contract_text):
-    """Proves the order plumbing works with no real risk: a 1-contract limit BUY at half the bid
-    (it cannot fill), read it back, cancel it, confirm the cancel. If everything passes it writes
-    today's date to live_armed.txt, which is what lets live orders go out today.
-    Run it after 9:30 AM ET on a contract with a bid of at least 0.50."""
-    s = Settings()
-    m = CONTRACT_RE.search(clean_line(contract_text or ""))
-    if not m:
-        sys.exit('Usage: python sniper_shadow.py --test-order "SPCX 172.5C 10/30"   (any contract with a bid of 0.50+)')
-    ticker, strike, cp = m["ticker"], float(m["strike"]), m["cp"][0]
-    now = datetime.now(ET)
-    exp = infer_expiry(int(m["month"]), int(m["day"]), None, now.date())
-    results = []
-
-    def step(name, ok, detail=""):
-        results.append(ok)
-        print(f"  {'PASS' if ok else 'FAIL'}  {name}  {detail}")
-        return ok
-
-    print(f"\nTEST ORDER on {ticker} {strike:g}{cp} {exp:%m/%d} - one contract, priced so it cannot fill\n")
-    if not market_is_open(now):
-        sys.exit("The market is closed. Robinhood only takes option orders 9:30-4:00 ET. Run this after the open.")
-    rh = Robinhood(s)
-    rh.login()
-    q = rh.quote(ticker, exp, strike, cp)
-    if not step("read a live quote", bool(q and q.get("bid")), f"{q}"):
-        sys.exit("No quote - check the contract text.")
-    if not step("bid is at least 0.50 (so a half-price order can't fill)", q["bid"] >= 0.50, f"bid {q['bid']}"):
-        sys.exit("Pick a contract with a higher bid.")
-    bp = Broker(rh, s, print).buying_power()
-    step("read buying power", bp is not None, f"${bp:,.0f}" if bp is not None else "")
-    try:
-        held = rh.holdings()
-        step("read open option positions", True, f"{len(held)} long position(s)")
-    except Exception as e:
-        step("read open option positions", False, str(e))
-    broker = Broker(rh, s, print)
-    tick = broker.tick_size(ticker, exp, strike, cp, q["bid"])
-    price = max(round_to_tick(q["bid"] * 0.5, tick, "down"), tick)
-    try:
-        order = rh.place("buy", ticker, exp, strike, cp, 1, price)
-    except Exception as e:
-        order = {"detail": f"raised {e}"}
-    oid = (order or {}).get("id")
-    if not step("placed the order", bool(oid), f"limit {price}, order {oid}" if oid else f"{order}"):
-        sys.exit("Order placement failed - nothing was sent. Live mode will not arm.")
-    info = broker._wait(oid, 4)
-    state = info.get("state")
-    if state == "filled":
-        step("order stayed unfilled", False, "IT FILLED - you now hold 1 contract; sell it by hand in Robinhood")
-        sys.exit(1)
-    step("order is open and readable", state not in Broker.BAD, f"state: {state}")
-    try:
-        rh.cancel(oid)
-    except Exception as e:
-        print(f"  cancel call raised: {e}")
-    info = broker._wait(oid, 8)
-    step("cancel confirmed", info.get("state") in Broker.BAD, f"state: {info.get('state')}")
-    if all(results):
-        with open(ARMED_FILE, "w", encoding="utf-8") as f:
-            f.write(now.strftime("%Y-%m-%d"))
-        print("\nALL PASSED - live orders are armed for today. (Run this again tomorrow.)")
-    else:
-        print("\nSOMETHING FAILED - live orders stay disarmed. Do not trade live until this passes.")
-        sys.exit(1)
 
 
 # ----------------------------------------------------------------------------
@@ -2479,6 +2452,8 @@ def selftest():
         return {"bid": b[0], "ask": b[1], "mark": sum(b) / 2} if b else None
 
     s = Settings()
+
+    s.keep_runner = False          # 1 contract per alert here (runner: selftest_runner)
     eng = Engine(s, quotes, notify=lambda t: print("   ->", t), now=lambda: clock["t"],
                  log_path=os.path.join(tmp, "log.csv"), state_path=os.path.join(tmp, "s.json"))
 
@@ -2532,15 +2507,17 @@ def selftest():
     selftest_watch()
     selftest_entry_rules()
     selftest_failures()
+    selftest_runner()
 
 
 class _FakeAPI:
     """Stands in for Robinhood's order system. Each placed order follows the next scripted behaviour:
     fill | nofill (stays open until cancelled) | fill_on_cancel (fills just as we cancel) |
-    stuck (cancel never lands) | refuse (Robinhood rejects the request)."""
+    fill_one (1 contract fills, the rest is cancelled) | stuck (cancel never lands) |
+    refuse (Robinhood rejects the request)."""
 
     def __init__(self):
-        self.orders, self.script, self.placed, self.n = {}, [], [], 0
+        self.orders, self.script, self.placed, self.sizes, self.n = {}, [], [], [], 0
         self.held, self.bp, self.open = [], 5000.0, []
         self.ticks = {"above_tick": "0.10", "below_tick": "0.05", "cutoff_price": "3.00"}
 
@@ -2556,17 +2533,22 @@ class _FakeAPI:
             return {"detail": "Not enough buying power."}
         self.n += 1
         oid = f"o{self.n}"
-        self.orders[oid] = {"id": oid, "state": "queued", "beh": beh, "price": price,
+        self.orders[oid] = {"id": oid, "state": "queued", "beh": beh, "price": price, "qty": qty,
                             "processed_quantity": "0", "legs": [{"executions": []}]}
         self.placed.append((side, price))
+        self.sizes.append((side, qty))
         if beh == "fill":
             self._fill(oid)
+        elif beh == "fill_one":                  # only 1 contract fills; the rest stays open until cancelled
+            self._fill(oid, 1)
+            self.orders[oid]["state"] = "partially_filled"
         return {"id": oid, "state": "unconfirmed"}
 
-    def _fill(self, oid):
+    def _fill(self, oid, n=None):
         o = self.orders[oid]
-        o.update(state="filled", processed_quantity="1")
-        o["legs"][0]["executions"] = [{"price": str(o["price"]), "quantity": "1"}]
+        n = o["qty"] if n is None else n
+        o.update(state="filled", processed_quantity=str(n))
+        o["legs"][0]["executions"] = [{"price": str(o["price"]), "quantity": str(n)}]
 
     def order_info(self, oid):
         return dict(self.orders[oid])
@@ -2598,6 +2580,7 @@ def selftest_watch():
     clock = {"t": datetime(2026, 10, 6, 10, 0, 0, tzinfo=ET)}
     book, notes = {}, []
     s = Settings()
+    s.keep_runner = False          # 1 contract per alert here (runner: selftest_runner)
     s.max_deployed, s.max_open_positions, s.max_buys_per_day = 5000, 10, 20
     s.max_single_contract_cost, s.project_capital = 1000, 5000
 
@@ -2613,7 +2596,7 @@ def selftest_watch():
                      now=lambda: clock["t"])
         return Engine(s, quotes, lambda x: notes.append(x), now=lambda: clock["t"],
                       log_path=os.path.join(tmp, "log.csv"), state_path=os.path.join(tmp, "s.json"),
-                      broker=brk, armed=lambda: True, stop_file=stopf)
+                      broker=brk, stop_file=stopf)
 
     eng = build()
 
@@ -2793,6 +2776,7 @@ def selftest_entry_rules():
     clock = {"t": datetime(2026, 10, 6, 10, 0, 0, tzinfo=ET)}
     book, notes = {}, []
     s = Settings()
+    s.keep_runner = False          # 1 contract per alert here (runner: selftest_runner)
     s.max_deployed, s.max_open_positions, s.max_buys_per_day = 5000, 20, 50
     s.max_single_contract_cost, s.project_capital = 1000, 5000
 
@@ -2807,7 +2791,7 @@ def selftest_entry_rules():
                  path_csv=os.path.join(tmp, "paths.csv"), save=lambda: None, notify=lambda x: None)
     eng = Engine(s, quotes, lambda x: notes.append(x), now=lambda: clock["t"],
                  log_path=os.path.join(tmp, "log.csv"), state_path=os.path.join(tmp, "s.json"),
-                 tracker=tr, broker=brk, armed=lambda: True, stop_file=os.path.join(tmp, "STOP_TRADING"))
+                 tracker=tr, broker=brk, stop_file=os.path.join(tmp, "STOP_TRADING"))
 
     def feed(text, age=2, source="live"):
         clock["t"] += timedelta(seconds=3)
@@ -2936,6 +2920,7 @@ def selftest_failures():
     clock = {"t": datetime(2026, 10, 6, 10, 0, 0, tzinfo=ET)}
     book, notes = {}, []
     s = Settings()
+    s.keep_runner = False          # 1 contract per alert here (runner: selftest_runner)
     s.max_deployed, s.max_open_positions, s.max_buys_per_day = 5000, 20, 50
     s.max_single_contract_cost, s.project_capital = 1000, 5000
 
@@ -2948,7 +2933,7 @@ def selftest_failures():
                      now=lambda: clock["t"])
         return Engine(s, quotes, lambda x: notes.append(x), now=lambda: clock["t"],
                       log_path=os.path.join(tmp, "log.csv"), state_path=os.path.join(tmp, "s.json"),
-                      broker=brk, armed=lambda: True, stop_file=os.path.join(tmp, "STOP_TRADING"))
+                      broker=brk, stop_file=os.path.join(tmp, "STOP_TRADING"))
 
     def feed(eng, text, age=2, source="live"):
         clock["t"] += timedelta(seconds=3)
@@ -3066,10 +3051,174 @@ def selftest_failures():
     print("\n  all failure-handling checks passed")
 
 
+def selftest_runner():
+    """The runner: 2 contracts when both fit within MAX_SINGLE_CONTRACT_COST. The first is sold at his first
+    trim (or by the take-profit); the runner only when he is fully out, or if it falls back to our buy price."""
+    import tempfile
+    print("\n\n========== runner: 2 contracts, 1 sold at his first trim, 1 kept until he is out ==========")
+    tmp = tempfile.mkdtemp()
+    clock = {"t": datetime(2026, 10, 6, 10, 0, 0, tzinfo=ET)}
+    book, notes = {}, []
+    s = Settings()
+    s.keep_runner, s.max_single_contract_cost, s.max_deployed, s.project_capital = True, 500, 5000, 5000
+    s.max_open_positions, s.max_buys_per_day, s.take_profit_pct, s.disaster_stop_pct = 20, 50, 40, 50
+
+    def quotes(ticker, exp, strike, cp):
+        b = book.get(ticker)
+        return {"bid": b[0], "ask": b[1], "mark": round((b[0] + b[1]) / 2, 3)} if b else None
+
+    api = _FakeAPI()
+
+    def build():
+        brk = Broker(api, s, lambda x: None, orders_csv=os.path.join(tmp, "orders.csv"), sleep=lambda x: None,
+                     now=lambda: clock["t"])
+        return Engine(s, quotes, lambda x: notes.append(x), now=lambda: clock["t"],
+                      log_path=os.path.join(tmp, "log.csv"), state_path=os.path.join(tmp, "s.json"),
+                      broker=brk, stop_file=os.path.join(tmp, "STOP_TRADING"))
+
+    eng = build()
+
+    def feed(text, e=None):
+        clock["t"] += timedelta(seconds=3)
+        notes.clear()
+        return (e or eng).handle_message(text, clock["t"] - timedelta(seconds=2))
+
+    def tick(sec=11):
+        clock["t"] += timedelta(seconds=sec)
+        notes.clear()
+        eng.tick()
+
+    def check(label, cond, detail=""):
+        print(f"  {'PASS' if cond else 'FAIL'}  {label}  {detail}")
+        assert cond, label
+
+    def pos(ticker, e=None):
+        return next((p for p in (e or eng).positions if p.ticker == ticker and p.qty_open > 0), None)
+
+    # --- how many to buy ------------------------------------------------------------------------
+    book["RNA"] = (1.95, 2.00)
+    r = feed("BOUGHT RNA 100C 10/16 2.0")
+    check("2 fit within $500 -> buys 2, as a runner",
+          r[0][0] == "BOUGHT" and r[0][2] == 2 and pos("RNA").runner and api.sizes[-1] == ("buy", 2), str(r[0]))
+    check("...and the buy card says so", any("1 runner kept" in n for n in notes), str(notes))
+    book["RNB"] = (2.40, 2.47)
+    r = feed("BOUGHT RNB 100C 10/16 2.47")
+    check("2 fit at the ask (2 x $247) but not at the limit price (2 x $255) -> buys 1",
+          r[0][0] == "BOUGHT" and r[0][2] == 1 and not pos("RNB").runner, str(r[0]))
+    book["RNC"] = (2.95, 3.00)
+    r = feed("BOUGHT RNC 100C 10/16 3.0")
+    check("2 would cost more than $500 -> buys 1, as before", r[0][2] == 1 and not pos("RNC").runner, str(r[0]))
+    book["RNM"] = (1.95, 2.00)
+    r = feed("BOUGHT RNM 100C 10/16 2.0‼️")
+    check("a lotto that 2 would fit: still just 1 contract", r[0][0] == "BOUGHT" and r[0][2] == 1
+          and not pos("RNM").runner and pos("RNM").lotto, str(r[0]))
+    book["RNN"] = (1.95, 2.00)
+    r = feed("BOUGHT RNN 100C 10/16 2.0 - small lotto")
+    check("...the same when he writes 'lotto'", r[0][2] == 1 and not pos("RNN").runner, str(r[0]))
+
+    # --- his trims and his full exit ------------------------------------------------------------
+    pot = eng.live_realized
+    book["RNA"] = (2.55, 2.60)
+    r = feed("SOLD 1/4 RNA 100C 10/16 2.6")
+    check("his first trim (even a 1/4) sells 1 of the 2",
+          r[0][0] == "SOLD" and r[0][2] == 1 and pos("RNA").qty_open == 1, str(r[0]))
+    check("...and says the runner is kept", any("RUNNER kept" in n for n in notes), str(notes))
+    r = feed("SOLD 1/4 RNA 100C 10/16 2.8")
+    check("his next trim: the runner is held", r[0][0] == "HOLD" and pos("RNA").qty_open == 1, str(r[0]))
+    book["RNA"] = (3.40, 3.50)
+    tick()
+    check("the runner has no take-profit (up 66%, still held)", pos("RNA") is not None)
+    r = feed("ALL OUT RNA 100C 10/16 3.45")
+    check("his ALL OUT sells the runner", r[0][0] == "SOLD" and r[0][2] == 1 and pos("RNA") is None, str(r[0]))
+    check("both sales count in the pot (+$50 and +$135)", abs(eng.live_realized - pot - 185) < 0.01,
+          str(eng.live_realized - pot))
+
+    book["RNG"] = (1.95, 2.00)
+    feed("BOUGHT RNG 100C 10/16 2.0")
+    book["RNG"] = (2.55, 2.60)
+    feed("SOLD 1/2 RNG 100C 10/16 2.6")
+    r = feed("SOLD 1/2 RNG 100C 10/16 2.8")
+    check("his sells adding up to all of it also sell the runner", r[0][0] == "SOLD" and pos("RNG") is None, str(r[0]))
+    book["RNH"] = (1.95, 2.00)
+    feed("BOUGHT RNH 100C 10/16 2.0")
+    r = feed("SOLD RNH 100C 10/16 2.1")
+    check("a sell with no size (he is out) sells both at once",
+          r[0][0] == "SOLD" and r[0][2] == 2 and pos("RNH") is None, str(r[0]))
+
+    # --- the bot's own exits ------------------------------------------------------------------------
+    book["RND"] = (1.95, 2.00)
+    feed("BOUGHT RND 100C 10/16 2.0")
+    book["RND"] = (2.55, 2.60)
+    feed("SOLD 1/2 RND 100C 10/16 2.6")
+    book["RND"] = (2.00, 2.10)                       # mid 2.05: back to our buy price
+    tick()
+    check("runner falls back to our buy price -> sold by the runner stop",
+          pos("RND") is None and any("runner stop" in n for n in notes), str(notes))
+
+    book["RNE"] = (1.95, 2.00)
+    feed("BOUGHT RNE 100C 10/16 2.0")
+    book["RNE"] = (2.95, 3.00)                       # bid 44% over our 2.05
+    tick()
+    check("take-profit sells 1 of the 2 and keeps the runner", pos("RNE") and pos("RNE").qty_open == 1, str(notes))
+    tick()
+    check("...and does not fire again on the runner", pos("RNE") and pos("RNE").qty_open == 1)
+    r = feed("SOLD 1/2 RNE 100C 10/16 3.0")
+    check("his first trim after that: the runner is held", r[0][0] == "HOLD", str(r[0]))
+    r = feed("ALL OUT RNE 100C 10/16 3.5")
+    check("...until his ALL OUT", r[0][0] == "SOLD" and pos("RNE") is None, str(r[0]))
+
+    book["RNF"] = (1.95, 2.00)
+    feed("BOUGHT RNF 100C 10/16 2.0")
+    book["RNF"] = (0.90, 1.00)                       # mid 0.95: down 54%
+    tick()
+    check("disaster stop before any trim sells both", pos("RNF") is None and api.sizes[-1] == ("sell", 2),
+          str(api.sizes[-1]))
+
+    # --- limits and odd cases ---------------------------------------------------------------------
+    book["RNI"] = (1.95, 2.00)
+    api.script = ["fill_one"]
+    r = feed("BOUGHT RNI 100C 10/16 2.0")
+    check("only 1 of the 2 filled -> an ordinary 1-contract position",
+          r[0][2] == 1 and pos("RNI").qty_orig == 1 and not pos("RNI").runner, str(r[0]))
+    r = feed("SOLD 1/2 RNI 100C 10/16 2.6")
+    check("...which sells at his half, as before", r[0][0] == "SOLD" and pos("RNI") is None, str(r[0]))
+
+    s.project_capital += 300 - eng.capital_free()     # leave $300 of the pot free
+    book["RNJ"] = (1.95, 2.00)
+    r = feed("BOUGHT RNJ 100C 10/16 2.0")
+    check("only $300 of the pot free: buys 1, not 2", r[0][0] == "BOUGHT" and r[0][2] == 1, str(r[0]))
+    s.project_capital = 5000
+
+    s.keep_runner = False
+    book["RNK"] = (1.95, 2.00)
+    r = feed("BOUGHT RNK 100C 10/16 2.0")
+    check("KEEP_RUNNER=false -> 1 contract", r[0][2] == 1 and not pos("RNK").runner, str(r[0]))
+    s.keep_runner = True
+
+    book["RNL"] = (1.95, 2.00)
+    feed("BOUGHT RNL 100C 10/16 2.0")
+    book["RNL"] = (2.55, 2.60)
+    feed("SOLD 1/4 RNL 100C 10/16 2.6")
+    eng2 = build()
+    check("after a restart the runner is still a runner", pos("RNL", eng2) and pos("RNL", eng2).runner_left)
+
+    paper = Engine(s, quotes, lambda x: notes.append(x), now=lambda: clock["t"],
+                   log_path=os.path.join(tmp, "paper_log.csv"), state_path=os.path.join(tmp, "paper.json"),
+                   stop_file=os.path.join(tmp, "STOP_TRADING"))
+    book["RNP"] = (1.95, 2.00)
+    r = feed("BOUGHT RNP 100C 10/16 2.0", paper)
+    check("paper mode: WOULD BUY 2", r[0][0] == "WOULD BUY" and r[0][2] == 2, str(r[0]))
+    book["RNP"] = (2.55, 2.60)
+    r = feed("SOLD 1/2 RNP 100C 10/16 2.6", paper)
+    check("paper mode: his first trim -> WOULD SELL 1, runner kept",
+          r[0][0] == "WOULD SELL" and r[0][2] == 1 and pos("RNP", paper).runner_left, str(r[0]))
+    print("\n  all runner checks passed")
+
+
 def selftest_live():
     """The live-order flow against a pretend Robinhood: fills, timeouts, a fill that lands during
     the cancel, a cancel that never confirms, refused orders, a sell that needs repricing, the
-    disaster stop, the kill switch, the daily arming gate and the start-up reconcile."""
+    disaster stop, the kill switch and the start-up reconcile."""
     import tempfile
     print("\n\n========== LIVE order flow (pretend Robinhood) ==========")
     tmp = tempfile.mkdtemp()
@@ -3077,6 +3226,7 @@ def selftest_live():
     book = {}                                    # ticker -> (bid, ask)
     notes = []
     s = Settings()
+    s.keep_runner = False          # 1 contract per alert here (runner: selftest_runner)
     s.max_buys_per_day, s.disaster_stop_pct, s.partial_rounding = 6, 50, "nearest"
 
     def quotes(ticker, exp, strike, cp):
@@ -3084,7 +3234,6 @@ def selftest_live():
         return {"bid": b[0], "ask": b[1], "mark": round((b[0] + b[1]) / 2, 3)} if b else None
 
     api = _FakeAPI()
-    state = {"armed": True}
     stopf = os.path.join(tmp, "STOP_TRADING")
 
     def build(path="s.json"):
@@ -3092,7 +3241,7 @@ def selftest_live():
                      now=lambda: clock["t"])
         return Engine(s, quotes, lambda x: notes.append(x), now=lambda: clock["t"],
                       log_path=os.path.join(tmp, "log.csv"), state_path=os.path.join(tmp, path),
-                      broker=brk, armed=lambda: state["armed"], stop_file=stopf)
+                      broker=brk, stop_file=stopf)
 
     eng = build()
 
@@ -3211,10 +3360,6 @@ def selftest_live():
 
     # --- gates --------------------------------------------------------------------
     book["HHH"] = (1.0, 1.05)
-    state["armed"] = False
-    r = feed("BOUGHT HHH 100C 10/9 1.0")
-    check("not armed -> no order", r[0][0] == "SKIP" and "NOT ARMED" in r[0][2], r[0][2])
-    state["armed"] = True
     open(stopf, "w").close()
     r = feed("BOUGHT HHH 100C 10/9 1.0")
     check("STOP_TRADING file -> no new buys", r[0][0] == "SKIP" and "STOP_TRADING" in r[0][2], r[0][2])
@@ -3317,6 +3462,8 @@ def selftest_exit_typos():
         return out
 
     s = Settings()
+
+    s.keep_runner = False          # 1 contract per alert here (runner: selftest_runner)
     tr = Tracker(s, qmany, lambda tk: {}, now=lambda: clock["t"], path_csv=os.path.join(tmp, "p.csv"),
                  save=lambda: None, notify=lambda x: None)
     eng = Engine(s, q1, lambda x: print("   ->", x), now=lambda: clock["t"],
@@ -3404,6 +3551,7 @@ def selftest_tracker():
 
     def build():
         s = Settings()
+        s.keep_runner = False          # 1 contract per alert here (runner: selftest_runner)
         tr = Tracker(s, qmany, under, now=lambda: clock["t"], path_csv=os.path.join(tmp, "paths.csv"),
                      save=lambda: None, notify=lambda x: print("   ->", x))
         eng = Engine(s, q1, lambda x: None, now=lambda: clock["t"], log_path=os.path.join(tmp, "log.csv"),
@@ -3477,9 +3625,6 @@ if __name__ == "__main__":
     refuse_old_layout()
     if "--list-chats" in sys.argv:
         asyncio.run(list_chats())
-    elif "--test-order" in sys.argv:
-        i = sys.argv.index("--test-order")
-        test_order(sys.argv[i + 1] if len(sys.argv) > i + 1 else "")
     else:
         try:
             asyncio.run(run())
