@@ -49,3 +49,7 @@ so treat the first day as a trial and watch it.
 - `!! NOT SOLD YET` - the exit hasn't filled; it keeps retrying lower. If it repeats, sell by hand in Robinhood.
 - `!! ... STATE UNKNOWN` - the bot could not confirm an order's final state. New buys are halted. Open Robinhood and check or cancel the order, then restart the bot.
 - `Start-up check: ...` - the bot compared its books with Robinhood and found a difference. It never touches positions it didn't buy.
+- `!! <contract>: Robinhood refused the sell twice ... removed from the bot's books` - Robinhood no longer shows that position, usually because you sold it by hand. The bot stops trying to sell it. Its profit or loss is not counted in the pot.
+- `!! Unexpected error in ...` - something went wrong inside the bot, but it kept running. Check Robinhood; the details are in the bot's window. Restart the bot if it repeats.
+- `!! Can't write to trades_log.csv ... is it open in Excel?` (in the bot's window) - the file is locked. Trading carries on and the lines are saved once you close it. To look at a log while the bot runs, open a copy.
+- `!! state.json could not be read ... Started from the spare copy` - the bot's memory file was damaged and it used `state.json.bak` instead. Compare the pot and open positions with Robinhood.

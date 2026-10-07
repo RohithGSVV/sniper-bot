@@ -29,9 +29,11 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field, asdict, replace
 from datetime import datetime, date, time as dtime, timedelta, tzinfo
 from fractions import Fraction
@@ -124,6 +126,35 @@ ARMED_FILE = os.path.join(DATA_DIR, "live_armed.txt")   # written by --test-orde
 STOP_FILE = os.path.join(HERE, "STOP_TRADING")          # create this file = no new buys (exits still work)
 OLD_LAYOUT_FILES = ["paper_positions.json", "robinhood.pickle", "sniper_session.session", "live_armed.txt",
                     "trades_log.csv", "price_paths.csv", "orders_log.csv", "stalls.csv"]
+
+_CSV_WAITING: dict[str, list] = {}      # rows that could not be written yet, by file
+_CSV_WARNED: dict[str, float] = {}
+
+
+def append_csv(path, cols, row):
+    """Add one row (a dict or a list) to a CSV file, writing the header first if the file is new.
+    A log that is open in Excel is locked and can't be written. That must never stop an order or the
+    timer, so the row is kept in memory and saved with the next row that gets through.
+    Returns True when everything is on disk."""
+    rows = _CSV_WAITING.pop(path, []) + [dict(row) if isinstance(row, dict) else list(row)]
+    try:
+        new = not os.path.exists(path)
+        # UTF-8 so emoji in alerts can be saved (Windows default can't);
+        # the "-sig" marker on a new file makes Excel open it correctly
+        with open(path, "a", newline="", encoding="utf-8-sig" if new else "utf-8") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(cols)
+            for r in rows:
+                w.writerow([r.get(c, "") for c in cols] if isinstance(r, dict) else r)
+        return True
+    except OSError as e:
+        _CSV_WAITING[path] = rows[-5000:]
+        if time.time() - _CSV_WARNED.get(path, 0) > 60:
+            _CSV_WARNED[path] = time.time()
+            print(f"!! Can't write to {os.path.basename(path)} ({type(e).__name__}) - is it open in Excel? Close it. "
+                  f"{len(rows)} line(s) are waiting and will be saved then.")
+        return False
 
 
 def refuse_old_layout():
@@ -410,6 +441,7 @@ class Position:
     lotto: bool = False
     exit_wanted: int = 0      # contracts we still need to sell (live: retried until done)
     exit_attempts: int = 0
+    exit_refused: int = 0     # sell orders in a row that Robinhood refused outright
     exit_why: str = ""
 
     @property
@@ -654,12 +686,7 @@ class Tracker:
                "underlying": under if under is not None else "", "iv": q.get("iv", ""),
                "delta": q.get("delta", ""), "volume": q.get("volume", ""),
                "min_since_his_buy": f"{mins:.1f}", "his_sold": t.his_sold, "note": ""}
-        new = not os.path.exists(self.path_csv)
-        with open(self.path_csv, "a", newline="", encoding="utf-8-sig" if new else "utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=PATH_COLS)
-            if new:
-                w.writeheader()
-            w.writerow(row)
+        append_csv(self.path_csv, PATH_COLS, row)
 
     def summary_lines(self):
         today = self.now().date().isoformat()
@@ -796,10 +823,37 @@ class Engine:
             os.replace(self.log_path, f"{base}_old_{self.now():%Y%m%d_%H%M%S}{ext}")
 
     # ---- persistence ------------------------------------------------------
+    def _read_state_file(self):
+        """The saved state ({} on a first run). If state.json can't be read (damaged by a power cut, say),
+        use the spare copy; if that fails too, stop rather than start with an empty memory."""
+        main, spare = self.state_path, self.state_path + ".bak"
+        if not os.path.exists(main) and not os.path.exists(spare):
+            return {}
+        problem = ""
+        for path in (main, spare):
+            if not os.path.exists(path):
+                problem = problem or "missing"
+                continue
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    raise ValueError("not a state file")
+            except (ValueError, OSError) as e:
+                problem = problem or type(e).__name__
+                continue
+            if path == spare:
+                self._notify(f"!! {os.path.basename(main)} could not be read ({problem}). Started from the spare copy: "
+                             f"check the pot and your open positions against Robinhood.")
+            return data
+        sys.exit(f"\n{main} is damaged ({problem}) and there is no readable spare copy.\n"
+                 f"Stopping here rather than starting with an empty memory: the project pot and open positions "
+                 f"would be forgotten.\nTo start fresh, move that file somewhere else, set PROJECT_CAPITAL to what is "
+                 f"really left, and check Robinhood for open positions.")
+
     def load_state(self):
-        if os.path.exists(self.state_path):
-            with open(self.state_path, encoding="utf-8") as f:
-                data = json.load(f)
+        data = self._read_state_file()
+        if data:
             allp = [Position(**p) for p in data.get("positions", [])]
             live_mode = self.broker is not None
             # paper positions are never mixed with real ones: drop the ones from the other mode
@@ -825,31 +879,55 @@ class Engine:
                 self.tracker.load(data.get("tracked", []))
 
     def save_state(self):
-        with open(self.state_path, "w", encoding="utf-8") as f:
-            json.dump({"positions": [asdict(p) for p in self.positions + list(getattr(self, "carried_over", []))],
-                       "pending_sells": self.pending_sells,
-                       "inflight": self.inflight,
-                       "ledger": {"live_realized": round(self.live_realized, 2), "started": self.project_started,
-                                  "loss_alerts": self.loss_alerts},
-                       "his_shorts": sorted(self.his_shorts),
-                       "seen_buys": sorted(self.seen_buys),
-                       "watching": self.watching,
-                       "last_msg_id": self.last_msg_id,
-                       "processed_ids": self.processed_ids[-2000:],
-                       "tracked": self.tracker.to_json() if self.tracker else []}, f, indent=2)
+        data = {"positions": [asdict(p) for p in self.positions + list(getattr(self, "carried_over", []))],
+                "pending_sells": self.pending_sells,
+                "inflight": self.inflight,
+                "ledger": {"live_realized": round(self.live_realized, 2), "started": self.project_started,
+                           "loss_alerts": self.loss_alerts},
+                "his_shorts": sorted(self.his_shorts),
+                "seen_buys": sorted(self.seen_buys),
+                "watching": self.watching,
+                "last_msg_id": self.last_msg_id,
+                "processed_ids": self.processed_ids[-2000:],
+                "tracked": self.tracker.to_json() if self.tracker else []}
+        # Write a new file and swap it in, so a crash or power cut mid-write can't leave half a file.
+        tmp = self.state_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        for _ in range(5):
+            try:
+                os.replace(tmp, self.state_path)
+                break
+            except PermissionError:          # Windows: another program has the file open for a moment
+                time.sleep(0.05)
+        else:
+            with open(self.state_path, "w", encoding="utf-8") as f:     # last resort: write in place
+                json.dump(data, f, indent=2)
+        # a spare copy of the same state, in case the main file is ever unreadable
+        try:
+            shutil.copyfile(self.state_path, self.state_path + ".bak")
+        except OSError:
+            pass
 
     def log(self, row: dict):
-        new = not os.path.exists(self.log_path)
         row.setdefault("msg_id", self.ctx.get("msg_id", ""))
         row.setdefault("source", self.ctx.get("source", ""))
-        # UTF-8 so emoji in alerts can be saved (Windows default can't);
-        # the "-sig" marker on a new file makes Excel open it correctly
-        with open(self.log_path, "a", newline="", encoding="utf-8-sig" if new else "utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=self.LOG_COLS, extrasaction="ignore")
-            if new:
-                w.writeheader()
-            row.setdefault("logged_at", self.now().strftime("%Y-%m-%d %H:%M:%S"))
-            w.writerow(row)
+        row.setdefault("logged_at", self.now().strftime("%Y-%m-%d %H:%M:%S"))
+        append_csv(self.log_path, self.LOG_COLS, row)
+
+    def _rows_today(self):
+        """Today's rows of the decision log, including any still waiting to be written (file open in Excel).
+        Raises OSError if the file can't be read."""
+        today = self.now().strftime("%Y-%m-%d")
+        rows = []
+        if os.path.exists(self.log_path):
+            with open(self.log_path, encoding="utf-8-sig", errors="replace") as f:
+                rows = list(csv.DictReader(f))
+        rows += [{c: "" if r.get(c) is None else str(r[c]) for c in self.LOG_COLS}
+                 for r in _CSV_WAITING.get(self.log_path, [])]
+        return [r for r in rows if (r.get("logged_at") or "").startswith(today)]
 
     # ---- market clock -----------------------------------------------------
     def market_open(self, t=None):
@@ -860,15 +938,7 @@ class Engine:
         return sum(p.entry_price * 100 * p.qty_open for p in self.positions)
 
     def realized_today(self):
-        if not os.path.exists(self.log_path):
-            return 0.0
-        today = self.now().strftime("%Y-%m-%d")
-        total = 0.0
-        with open(self.log_path, encoding="utf-8-sig", errors="replace") as f:
-            for r in csv.DictReader(f):
-                if r["logged_at"].startswith(today) and r["our_pnl"]:
-                    total += float(r["our_pnl"])
-        return total
+        return sum(float(r["our_pnl"]) for r in self._rows_today() if r.get("our_pnl"))
 
     def find_position(self, a: Alert):
         """Match a sell alert to what we hold.
@@ -1049,9 +1119,11 @@ class Engine:
         return ("CORRECTION", raw, about)
 
     def on_edit(self, text, edited_at):
-        self.log({"alert_time": f"{edited_at:%H:%M:%S}", "raw": text, "action": "EDITED",
-                  "decision": "LOGGED", "reason": "he edited an earlier message; not acted on"})
-        self.notify(f"Alert was EDITED (logged only, no trade): {text}")
+        with self.lock:                 # the log and self.ctx are shared with alerts and the timer
+            self.ctx = {}
+            self.log({"alert_time": f"{edited_at:%H:%M:%S}", "raw": text, "action": "EDITED",
+                      "decision": "LOGGED", "reason": "he edited an earlier message; not acted on"})
+            self.notify(f"Alert was EDITED (logged only, no trade): {text}")
 
     # ---- buys -------------------------------------------------------------
     def on_buy(self, a: Alert, alert_time: datetime, source="live", from_watch=False):
@@ -1123,9 +1195,15 @@ class Engine:
                 return skip(f"already holding {same[0].contract} - one position per stock", transient=True)
         if len([p for p in self.positions if p.qty_open > 0]) >= self.s.max_open_positions:
             return skip(f"max {self.s.max_open_positions} open positions", transient=True)
-        if self.realized_today() <= -self.s.daily_loss_limit:
+        try:
+            lost_today, bought_today = self.realized_today(), self.buys_today()
+        except OSError as e:
+            # can't check the daily limits -> don't buy
+            return skip(f"can't read today's log to check the daily limits ({type(e).__name__}) - "
+                        f"is it open in another program?", transient=True)
+        if lost_today <= -self.s.daily_loss_limit:
             return skip("daily loss limit hit")
-        if self.buys_today() >= self.s.max_buys_per_day:
+        if bought_today >= self.s.max_buys_per_day:
             return skip(f"already made {self.s.max_buys_per_day} buys today (MAX_BUYS_PER_DAY)")
         if late_swing and not from_watch:
             # An alert this late came in a burst (bot asleep or offline), with any sell he posted queued right
@@ -1385,13 +1463,13 @@ class Engine:
         self.live_realized += pnl
         left = self.capital_left()
         if self.project_over():
-            self.notify(f"!! PROJECT ENDED: the ${self.s.project_capital:,.0f} is gone "
-                        f"(live P&L ${self.live_realized:+,.0f}). No more buys. Open positions will still be exited.")
+            self._notify(f"!! PROJECT ENDED: the ${self.s.project_capital:,.0f} is gone "
+                         f"(live P&L ${self.live_realized:+,.0f}). No more buys. Open positions will still be exited.")
         for level in (50, 75, 90):
             lost = (1 - left / self.s.project_capital) * 100
             if lost >= level and level not in self.loss_alerts and left > 0:
                 self.loss_alerts.append(level)
-                self.notify(f"!! Project capital is down {level}%+: ${left:,.0f} left of ${self.s.project_capital:,.0f}.")
+                self._notify(f"!! Project capital is down {level}%+: ${left:,.0f} left of ${self.s.project_capital:,.0f}.")
         self.save_state()
 
     def capital_line(self):
@@ -1399,12 +1477,7 @@ class Engine:
                 f"(live P&L ${self.live_realized:+,.0f})")
 
     def buys_today(self):
-        if not os.path.exists(self.log_path):
-            return 0
-        today = self.now().strftime("%Y-%m-%d")
-        with open(self.log_path, encoding="utf-8-sig", errors="replace") as f:
-            return sum(1 for r in csv.DictReader(f)
-                       if r["logged_at"].startswith(today) and r["decision"] in ("WOULD BUY", "BOUGHT"))
+        return sum(1 for r in self._rows_today() if r.get("decision") in ("WOULD BUY", "BOUGHT"))
 
     # ---- sells ------------------------------------------------------------
     def on_sell(self, a: Alert, alert_time: datetime, from_queue=False, fix_note=""):
@@ -1490,10 +1563,11 @@ class Engine:
         (exit_wanted) and the timer tries again at a lower price until it is out."""
         res = self.broker.sell_once(pos.ticker, date.fromisoformat(pos.exp), pos.strike, pos.cp, qty, q,
                                     pos.exit_attempts, on_order=self._track_order)
+        # messages about real orders go out even while catching up on missed alerts (self._notify)
         if res.state == "unknown":
             self.halted = f"could not confirm the state of sell order {res.order_id} on {pos.contract}"
-            self.notify(f"!! SELL ORDER STATE UNKNOWN for {pos.contract} (order {res.order_id}). "
-                        f"New buys are halted. Check Robinhood now.")
+            self._notify(f"!! SELL ORDER STATE UNKNOWN for {pos.contract} (order {res.order_id}). "
+                         f"New buys are halted. Check Robinhood now.")
         if res.qty > 0:
             price = res.price or (q or {}).get("bid") or 0.0
             pnl = (price - pos.entry_price) * 100 * res.qty
@@ -1511,23 +1585,49 @@ class Engine:
                        our_price=price, our_pnl=f"{pnl:.2f}", his_pnl_same_qty=f"{his:.2f}",
                        reason=f"LIVE order {res.order_id}: {why.strip()}".strip(": "))
             self.log(row)
-            self.notify(sell_message("SOLD", res.qty, pos.contract, price, pos.entry_price, his_price,
-                                     pos.his_entry, pnl, his, why, pos.qty_open))
+            self._notify(sell_message("SOLD", res.qty, pos.contract, price, pos.entry_price, his_price,
+                                      pos.his_entry, pnl, his, why, pos.qty_open))
             return ("SOLD", pos.contract, res.qty, price, round(pnl, 2))
         # not sold this time
         first = pos.exit_wanted == 0
         pos.exit_wanted = qty
         pos.exit_why = why.strip() or pos.exit_why
-        pos.exit_attempts += 1
+        if res.state == "failed":
+            # Robinhood refused the order, so it was never open. See whether we still hold the contract
+            # (it may have been sold by hand); if we do, retry more slowly and without lowering the price.
+            # Only drop it when two refusals in a row both find it gone: one reading can be incomplete.
+            have = self.broker.still_held(pos.ticker, pos.exp, pos.strike, pos.cp)
+            if have == 0 and pos.exit_refused >= 1:
+                return self._drop(pos, row, f"Robinhood refused the sell twice ({res.note or res.state}) and no "
+                                            f"longer shows this position")
+            if have and have < pos.qty_open:
+                pos.qty_open = have
+                pos.exit_wanted = min(qty, have)
+            pos.exit_refused += 1
+        else:
+            pos.exit_refused = 0
+            if res.state != "no_quote":
+                pos.exit_attempts += 1
         self.save_state()
-        n = pos.exit_attempts
+        n = pos.exit_attempts + pos.exit_refused
         if first or n in (3, 6) or n % 10 == 0:
             row.update(decision="SELL PENDING", qty=qty,
-                       reason=f"attempt {n}: {res.note or res.state}; will keep retrying at lower prices")
+                       reason=f"attempt {n}: {res.note or res.state}; will keep retrying")
             self.log(row)
-            self.notify(f"!! NOT SOLD YET: {pos.contract} (attempt {n}: {res.note or res.state}). "
-                        f"Retrying. If this repeats, sell it by hand in Robinhood.")
+            self._notify(f"!! NOT SOLD YET: {pos.contract} (attempt {n}: {res.note or res.state}). "
+                         f"Retrying. If this repeats, sell it by hand in Robinhood.")
         return ("SELL PENDING", pos.contract, n)
+
+    def _drop(self, pos, row, why):
+        """Take a real position off the bot's books without a sale of ours (sold by hand, say)."""
+        self.positions.remove(pos)
+        self.save_state()
+        row.update(decision="DROPPED", qty=pos.qty_open,
+                   reason=f"{why}; removed from the bot's books, P&L not counted in the pot")
+        self.log(row)
+        self._notify(f"!! {pos.contract}: {why}. Sold by hand? It is removed from the bot's books, and its profit "
+                     f"or loss is NOT counted in the project pot.")
+        return ("DROPPED", pos.contract)
 
     def retry_exits(self, now):
         if not self.broker or not self.market_open(now):
@@ -1535,7 +1635,9 @@ class Engine:
         for pos in list(self.positions):
             if pos.real and pos.exit_wanted > 0 and pos.qty_open > 0:
                 last = self._exit_tried.get(pos.contract)
-                if last and (now - last).total_seconds() < 3:
+                # normally every 3 s; after refused orders 10 s, 20 s, 40 s, then once a minute
+                wait = min(60, 5 * 2 ** min(pos.exit_refused, 6)) if pos.exit_refused else 3
+                if last and (now - last).total_seconds() < wait:
                     continue
                 self._exit_tried[pos.contract] = now
                 row = {"alert_time": "", "raw": "(retrying exit)", "action": "SELL_RETRY", "contract": pos.contract}
@@ -1626,10 +1728,11 @@ class Engine:
 
     def summary(self):
         today = self.now().strftime("%Y-%m-%d")
-        rows = []
-        if os.path.exists(self.log_path):
-            with open(self.log_path, encoding="utf-8-sig", errors="replace") as f:
-                rows = [r for r in csv.DictReader(f) if r["logged_at"].startswith(today)]
+        try:
+            rows = self._rows_today()
+        except OSError as e:
+            rows = []
+            print(f"summary: can't read today's log ({type(e).__name__}) - is it open in another program?")
         buys = [r for r in rows if r["decision"] in ("WOULD BUY", "BOUGHT")]
         skips = [r for r in rows if r["decision"] == "SKIP"]
         sells = [r for r in rows if r["decision"] in ("WOULD SELL", "SOLD")]
@@ -1854,12 +1957,8 @@ class Broker:
     # ---- small helpers ----------------------------------------------------------
     def _log(self, action, contract, qty, limit, order_id, state, fill, note=""):
         cols = ["ts", "action", "contract", "qty", "limit", "order_id", "state", "fill_price", "note"]
-        new = not os.path.exists(self.orders_csv)
-        with open(self.orders_csv, "a", newline="", encoding="utf-8-sig" if new else "utf-8") as f:
-            w = csv.writer(f)
-            if new:
-                w.writerow(cols)
-            w.writerow([f"{self.now():%Y-%m-%d %H:%M:%S}", action, contract, qty, limit, order_id, state, fill, note])
+        append_csv(self.orders_csv, cols,
+                   [f"{self.now():%Y-%m-%d %H:%M:%S}", action, contract, qty, limit, order_id, state, fill, note])
 
     def tick_size(self, ticker, exp, strike, cp, price):
         try:
@@ -1972,6 +2071,14 @@ class Broker:
         return self._send_and_wait("sell", ticker, exp, strike, cp, qty, round(price, 2),
                                    self.s.sell_attempt_sec, on_order)
 
+    def still_held(self, ticker, exp_iso, strike, cp):
+        """How many of this contract Robinhood shows on the account right now (None = could not read)."""
+        try:
+            return sum(q for t, e, k, c, q in self.api.holdings() if (t, e, k, c) == (ticker, exp_iso, strike, cp))
+        except Exception as e:
+            print(f"could not read your Robinhood positions: {e}")
+            return None
+
     # ---- start-up checks --------------------------------------------------------
     def reconcile(self, positions):
         """Compare what the bot believes it holds with what Robinhood says.
@@ -2054,14 +2161,9 @@ def protect_from_freezing():
 
 
 def log_stall(start: datetime, end: datetime):
-    path = STALLS_CSV()
-    new = not os.path.exists(path)
-    with open(path, "a", newline="", encoding="utf-8-sig" if new else "utf-8") as f:
-        w = csv.writer(f)
-        if new:
-            w.writerow(["froze_from", "resumed_at", "minutes"])
-        w.writerow([f"{start:%Y-%m-%d %H:%M:%S}", f"{end:%Y-%m-%d %H:%M:%S}",
-                    f"{(end - start).total_seconds() / 60:.1f}"])
+    append_csv(STALLS_CSV(), ["froze_from", "resumed_at", "minutes"],
+               [f"{start:%Y-%m-%d %H:%M:%S}", f"{end:%Y-%m-%d %H:%M:%S}",
+                f"{(end - start).total_seconds() / 60:.1f}"])
 
 
 def live_is_armed(s, now=None):
@@ -2152,6 +2254,20 @@ async def run():
                   "NOT ARMED: run  python sniper_shadow.py --test-order \"<one of his open contracts>\"  "
                   "after 9:30 AM to arm it. Until then buys are skipped."))
     status = {"last_alert": None, "down_since": None, "warned": False}
+    errors = {"n": 0, "told_at": {}}
+
+    def report_error(where, e):
+        """An unexpected error must be seen but must not stop the bot: the timer loop runs the stops,
+        exits and watches. Printed every time; messaged at most once every 5 minutes per place."""
+        errors["n"] += 1
+        now = datetime.now(ET)
+        print(f"[{now:%H:%M:%S}] !! unexpected error in {where}: {type(e).__name__}: {e}")
+        traceback.print_exception(type(e), e, e.__traceback__)
+        last = errors["told_at"].get(where)
+        if last is None or (now - last).total_seconds() >= 300:
+            errors["told_at"][where] = now
+            notify(f"!! Unexpected error in {where}: {type(e).__name__}: {e}. The bot keeps running "
+                   f"({errors['n']} error(s) so far). Check Robinhood, and restart the bot if this repeats.")
 
     @client.on(events.NewMessage(chats=chat_id))
     async def on_new(event):
@@ -2160,12 +2276,18 @@ async def run():
         status["last_alert"] = datetime.now(ET)
         print(f"\n[{datetime.now(ET):%H:%M:%S}] ALERT ({alert_time:%H:%M:%S}): {text}")
         async with rh_lock:
-            await asyncio.to_thread(engine.handle_message, text, alert_time, event.message.id, "live")
+            try:
+                await asyncio.to_thread(engine.handle_message, text, alert_time, event.message.id, "live")
+            except Exception as e:
+                report_error(f"the alert '{text[:80]}' (handle this one by hand)", e)
 
     @client.on(events.MessageEdited(chats=chat_id))
     async def on_edit(event):
         edited_at = (event.message.edit_date or event.message.date).astimezone(ET)
-        await asyncio.to_thread(engine.on_edit, event.raw_text or "", edited_at)
+        try:
+            await asyncio.to_thread(engine.on_edit, event.raw_text or "", edited_at)
+        except Exception as e:
+            report_error("an edited message", e)
 
     # ---- catch up on anything posted while the bot was off ----------------
     async def catch_up():
@@ -2194,8 +2316,11 @@ async def run():
             engine.quiet = True
             try:
                 for m in msgs:
-                    await asyncio.to_thread(engine.handle_message, m.raw_text,
-                                            m.date.astimezone(ET), m.id, "catch-up")
+                    try:
+                        await asyncio.to_thread(engine.handle_message, m.raw_text,
+                                                m.date.astimezone(ET), m.id, "catch-up")
+                    except Exception as e:
+                        report_error(f"the missed message '{m.raw_text[:80]}'", e)
             finally:
                 engine.quiet = False
         live = tracker.active()
@@ -2219,38 +2344,49 @@ async def run():
             prev_start = lap_start
             await asyncio.sleep(5)
             now = datetime.now(ET)
-            async with rh_lock:
-                await asyncio.to_thread(engine.tick)
-                if tracker.due():
-                    await asyncio.to_thread(tracker.sample)
-                else:
-                    tracker.sweep()
-            # connection watch
-            if not client.is_connected():
-                status["down_since"] = status["down_since"] or now
-                if (now - status["down_since"]).total_seconds() > 60 and not status["warned"]:
-                    status["warned"] = True
-                    print(f"[{now:%H:%M:%S}] !! Telegram disconnected for over a minute - alerts may be late")
-            elif status["down_since"]:
-                if status["warned"]:
-                    notify(f"Telegram reconnected after {(now - status['down_since']).total_seconds() / 60:.0f} min "
-                           f"- alerts in that gap will arrive late and buys will be skipped as old.")
-                status.update(down_since=None, warned=False)
-            # heartbeat line so you can see it's alive
-            if (now - last_beat).total_seconds() >= s.heartbeat_min * 60:
-                last_beat = now
-                la = status["last_alert"]
-                mode = ("LIVE armed" if live_is_armed(s) else "LIVE NOT ARMED") if broker else "shadow"
-                held = len([p for p in engine.positions if p.qty_open > 0])
-                cap = f" | capital ${engine.capital_left():,.0f}" if broker else ""
-                print(f"[{now:%H:%M:%S}] alive | {mode} | holding {held}{cap} | Telegram "
-                      f"{'connected' if client.is_connected() else 'DISCONNECTED'}"
-                      f" | tracking {len(tracker.active())} contracts"
-                      f"{f' | watching {len(engine.watching)}' if engine.watching else ''}"
-                      f" | last alert {f'{(now - la).total_seconds() / 60:.0f} min ago' if la else 'none yet'}")
-            if now.weekday() < 5 and now.time() >= dtime(16, 5) and summary_sent_for != now.date():
-                summary_sent_for = now.date()
-                notify(engine.summary())
+            # Each part is guarded on its own: an error in one must not end this loop or skip the others.
+            try:
+                async with rh_lock:
+                    await asyncio.to_thread(engine.tick)
+            except Exception as e:
+                report_error("the timer (stops, exits and watches)", e)
+            try:
+                async with rh_lock:
+                    if tracker.due():
+                        await asyncio.to_thread(tracker.sample)
+                    else:
+                        tracker.sweep()
+            except Exception as e:
+                report_error("the price tracker", e)
+            try:
+                # connection watch
+                if not client.is_connected():
+                    status["down_since"] = status["down_since"] or now
+                    if (now - status["down_since"]).total_seconds() > 60 and not status["warned"]:
+                        status["warned"] = True
+                        print(f"[{now:%H:%M:%S}] !! Telegram disconnected for over a minute - alerts may be late")
+                elif status["down_since"]:
+                    if status["warned"]:
+                        notify(f"Telegram reconnected after {(now - status['down_since']).total_seconds() / 60:.0f} min "
+                               f"- alerts in that gap will arrive late and buys will be skipped as old.")
+                    status.update(down_since=None, warned=False)
+                # heartbeat line so you can see it's alive
+                if (now - last_beat).total_seconds() >= s.heartbeat_min * 60:
+                    last_beat = now
+                    la = status["last_alert"]
+                    mode = ("LIVE armed" if live_is_armed(s) else "LIVE NOT ARMED") if broker else "shadow"
+                    held = len([p for p in engine.positions if p.qty_open > 0])
+                    cap = f" | capital ${engine.capital_left():,.0f}" if broker else ""
+                    print(f"[{now:%H:%M:%S}] alive | {mode} | holding {held}{cap} | Telegram "
+                          f"{'connected' if client.is_connected() else 'DISCONNECTED'}"
+                          f" | tracking {len(tracker.active())} contracts"
+                          f"{f' | watching {len(engine.watching)}' if engine.watching else ''}"
+                          f" | last alert {f'{(now - la).total_seconds() / 60:.0f} min ago' if la else 'none yet'}")
+                if now.weekday() < 5 and now.time() >= dtime(16, 5) and summary_sent_for != now.date():
+                    summary_sent_for = now.date()
+                    notify(engine.summary())
+            except Exception as e:
+                report_error("the status report", e)
 
     mode_txt = "LIVE MODE running - real orders once armed" if s.live_trading else "SHADOW MODE running - no real orders"
     print(f"\n{mode_txt}. Listening to chat {chat_id}. Ctrl+C to stop.\n")
@@ -2395,6 +2531,7 @@ def selftest():
     selftest_live()
     selftest_watch()
     selftest_entry_rules()
+    selftest_failures()
 
 
 class _FakeAPI:
@@ -2788,6 +2925,145 @@ def selftest_entry_rules():
     check("ONE_POSITION_PER_STOCK=false: both bought", r[0][0] == "BOUGHT", str(r[0]))
     s.one_position_per_stock = True
     print("\n  all entry-rule checks passed")
+
+
+def selftest_failures():
+    """Things going wrong around the bot: a log open in Excel, a damaged state file, a position sold by hand,
+    a real sale while catching up. None of them may stop the bot or go unreported."""
+    import stat
+    import tempfile
+    print("\n\n========== when things go wrong: locked log, damaged state file, sold by hand ==========")
+    clock = {"t": datetime(2026, 10, 6, 10, 0, 0, tzinfo=ET)}
+    book, notes = {}, []
+    s = Settings()
+    s.max_deployed, s.max_open_positions, s.max_buys_per_day = 5000, 20, 50
+    s.max_single_contract_cost, s.project_capital = 1000, 5000
+
+    def quotes(ticker, exp, strike, cp):
+        b = book.get(ticker)
+        return {"bid": b[0], "ask": b[1], "mark": round((b[0] + b[1]) / 2, 3)} if b else None
+
+    def build(tmp, api):
+        brk = Broker(api, s, lambda x: None, orders_csv=os.path.join(tmp, "orders.csv"), sleep=lambda x: None,
+                     now=lambda: clock["t"])
+        return Engine(s, quotes, lambda x: notes.append(x), now=lambda: clock["t"],
+                      log_path=os.path.join(tmp, "log.csv"), state_path=os.path.join(tmp, "s.json"),
+                      broker=brk, armed=lambda: True, stop_file=os.path.join(tmp, "STOP_TRADING"))
+
+    def feed(eng, text, age=2, source="live"):
+        clock["t"] += timedelta(seconds=3)
+        notes.clear()
+        return eng.handle_message(text, clock["t"] - timedelta(seconds=age), None, source)
+
+    def check(label, cond, detail=""):
+        print(f"  {'PASS' if cond else 'FAIL'}  {label}  {detail}")
+        assert cond, label
+
+    def has(eng, ticker):
+        return any(p.ticker == ticker and p.qty_open > 0 for p in eng.positions)
+
+    # --- the decision log can't be written (read-only: what a file open in Excel looks like to the bot) ---
+    tmp, api = tempfile.mkdtemp(), _FakeAPI()
+    eng = build(tmp, api)
+    book["LKA"] = (2.0, 2.05)
+    feed(eng, "BOUGHT LKA 100C 10/9 2.0")
+    os.chmod(eng.log_path, stat.S_IREAD)
+    book["LKA"] = (2.40, 2.50)
+    r = feed(eng, "ALL OUT LKA 100C 10/9 2.45")
+    check("log can't be written: the sale still goes through", r[0][0] == "SOLD" and not has(eng, "LKA"), str(r[0]))
+    check("...and you are still told", any("SOLD" in n for n in notes), str(notes))
+    check("...and today's profit/loss still counts it", abs(eng.realized_today() - 30.0) < 0.01, str(eng.realized_today()))
+    os.chmod(eng.log_path, stat.S_IREAD | stat.S_IWRITE)
+    feed(eng, "BOUGHT shares VST 138.59")                    # any next log line
+    with open(eng.log_path, encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+    check("once it can be written again, the waiting lines are saved in order",
+          [x["decision"] for x in rows[-2:]] == ["SOLD", "IGNORE"], str([x["decision"] for x in rows]))
+
+    # --- the state file is damaged (power cut mid-write) ------------------------------------------
+    with open(eng.state_path, encoding="utf-8") as f:
+        whole = f.read()
+    check("state file is complete after a save, nothing half-written left behind",
+          bool(json.loads(whole)) and not os.path.exists(eng.state_path + ".tmp"))
+    with open(eng.state_path, "w", encoding="utf-8") as f:
+        f.write(whole[: len(whole) // 2])
+    notes.clear()
+    eng2 = build(tmp, api)
+    check("damaged state file: starts from the spare copy with the pot intact",
+          abs(eng2.live_realized - 30.0) < 0.01, str(eng2.live_realized))
+    check("...and says so", any("spare copy" in n for n in notes), str(notes))
+    for path in (eng.state_path, eng.state_path + ".bak"):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{ not a state file")
+    try:
+        build(tmp, api)
+        stopped = False
+    except SystemExit:
+        stopped = True
+    check("state file and spare copy both damaged: refuses to start with an empty memory", stopped)
+
+    # --- Robinhood refuses a sell ----------------------------------------------------------------
+    tmp, api = tempfile.mkdtemp(), _FakeAPI()
+    eng = build(tmp, api)
+
+    def tick(sec=5):
+        clock["t"] += timedelta(seconds=sec)
+        notes.clear()
+        eng.tick()
+
+    book["HND"] = (2.0, 2.05)
+    feed(eng, "BOUGHT HND 100C 10/9 2.0")
+    api.held = []                                            # sold by hand in the app
+    api.script = ["refuse"] * 50
+    pot = eng.live_realized
+    r = feed(eng, "ALL OUT HND 100C 10/9 2.4")
+    check("sell refused, Robinhood shows no position: not dropped on one reading alone",
+          r[0][0] == "SELL PENDING" and has(eng, "HND"), str(r[0]))
+    said = []
+    for _ in range(24):
+        tick()
+        said += notes
+    check("refused again and still not shown: dropped from the books", not has(eng, "HND"))
+    check("...you are told, and the pot is left alone",
+          any("removed from the bot's books" in n for n in said) and eng.live_realized == pot, str(said))
+    check("...after two sell orders, and no more", len(api.script) == 48, str(50 - len(api.script)))
+
+    def not_answering():
+        raise RuntimeError("Robinhood is not answering")
+
+    book["RFS"] = (2.0, 2.05)
+    api.script = []
+    feed(eng, "BOUGHT RFS 100C 10/9 2.0")
+    api.held = []
+    api.holdings = not_answering                             # positions can't be read at all
+    api.script = ["refuse"] * 500
+    feed(eng, "ALL OUT RFS 100C 10/9 2.4")
+    for _ in range(60):                                      # five minutes of timer laps
+        tick()
+    check("sell refused and positions unreadable: never dropped", has(eng, "RFS"))
+    del api.holdings
+    api.held = [("RFS", "2026-10-09", 100.0, "C", 1)]        # readable again: still held, sells still refused
+    for _ in range(60):                                      # five more minutes
+        tick()
+    tries = 500 - len(api.script)
+    check("sell refused but still held: keeps trying, about once a minute instead of every lap",
+          has(eng, "RFS") and 8 <= tries <= 20, f"{tries} orders in 10 min")
+    api.script = []
+    for _ in range(15):
+        tick()
+    check("...and sells at the bid once Robinhood accepts the order (price not walked down meanwhile)",
+          not has(eng, "RFS") and api.placed[-1] == ("sell", 2.0), str(api.placed[-1]))
+
+    # --- a real sale while catching up on missed alerts ---------------------------------------------
+    book["QTS"] = (2.0, 2.05)
+    feed(eng, "BOUGHT QTS 100C 10/9 2.0")
+    book["QTS"] = (2.40, 2.50)
+    eng.quiet = True
+    r = feed(eng, "ALL OUT QTS 100C 10/9 2.45", age=600, source="catch-up")
+    eng.quiet = False
+    check("a real sale while catching up is still announced",
+          r[0][0] == "SOLD" and any("SOLD" in n for n in notes), str(notes))
+    print("\n  all failure-handling checks passed")
 
 
 def selftest_live():

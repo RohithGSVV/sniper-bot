@@ -26,7 +26,7 @@ docs/SETUP.md           first-time setup
 docs/LIVE.md            going live: checklist, controls, what the alerts mean
 tools/migrate_layout.py one-time move from the old flat layout
 data/                   the bot's memory and logins (git-ignored, never share)
-  state.json            positions, the pot, price watches
+  state.json            positions, the pot, price watches (state.json.bak is its spare copy)
   robinhood.pickle      saved Robinhood login
   sniper_session.session  saved Telegram login
   live_armed.txt        written by --test-order; allows live orders for that day
