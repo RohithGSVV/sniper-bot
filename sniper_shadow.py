@@ -207,8 +207,11 @@ class Settings:
         # mid price, since he often posts no exit on losers (they ran to zero in the observation week)
         self.disaster_stop_pct = float(_env("DISASTER_STOP_PCT", 50))
         self.max_buys_per_day = int(_env("MAX_BUYS_PER_DAY", 6))
-        # sell as soon as the bid is more than this % above what we paid (0 = off)
+        # once the bid is more than this % above what we paid (0 = off): with LOCK_PROFIT (default) don't sell -
+        # move the stop up to +LOCK_AT_PCT and hold for his exit; with LOCK_PROFIT=false, sell at once
         self.take_profit_pct = float(_env("TAKE_PROFIT_PCT", 40))
+        self.lock_profit = _env("LOCK_PROFIT", "true").lower() == "true"
+        self.lock_at_pct = float(_env("LOCK_AT_PCT", self.take_profit_pct))
         # late entry: a buy alert is still acted on up to this many minutes after he posts it, by expiry:
         # 0DTE uses LATE_ENTRY_MIN; short-dated (1-7 days) LATE_ENTRY_MIN_SHORT; swing (8+ days)
         # LATE_ENTRY_MIN_SWING, and a late swing is only bought while he hasn't sold any of it
@@ -447,6 +450,7 @@ class Position:
     exit_refused: int = 0     # sell orders in a row that Robinhood refused outright
     exit_why: str = ""
     runner: bool = False      # 2 contracts: 1 sold at his first trim, 1 (the runner) kept until he is fully out
+    locked: bool = False      # profit lock on: it passed +TAKE_PROFIT_PCT, sold if the bid falls back to +LOCK_AT_PCT
 
     @property
     def contract(self):
@@ -789,6 +793,7 @@ class Engine:
         self.lock = threading.RLock()  # alerts and the timer run in different threads
         self._stop_checked = {}
         self._exit_tried = {}
+        self._marks = {}              # contract -> last quote the stop checks saw (for the status line)
         self.s = settings
         self.quotes = quotes          # function(ticker, exp_date, strike, cp) -> dict or None
         self._notify = notify         # function(text)
@@ -1498,6 +1503,38 @@ class Engine:
         return (f"Project capital: ${self.capital_left():,.0f} left of ${self.s.project_capital:,.0f} "
                 f"(live P&L ${self.live_realized:+,.0f})")
 
+    def positions_line(self):
+        """Each open position with its profit or loss at the last traded price in the quote the stop checks
+        last saw (~10 s old), for the status line. Robinhood gives no time for that trade: with no volume
+        today it is from an earlier day, and it says so. No last trade -> the mid price, marked "mid".
+        Display only: the stops still use the bid and the mid. No lock: it only reads, and must never wait
+        behind a slow order."""
+        parts, total, priced = [], 0.0, 0
+        for p in list(self.positions):
+            if p.qty_open <= 0:
+                continue
+            name = (f"{p.qty_open}x {p.contract}" + (" runner" if p.runner_left else "")
+                    + (f" [lock +{self.s.lock_at_pct:g}%]" if p.locked else ""))
+            q = self._marks.get(p.contract) or {}
+            price, note = q.get("last"), ""
+            if price is not None and q.get("volume") == 0:
+                note = ", no trade today"
+            if price is None:
+                price, note = q.get("mark"), ", mid"
+                if price is None and q.get("bid") is not None and q.get("ask") is not None:
+                    price = (q["bid"] + q["ask"]) / 2
+            if price is None or not p.entry_price:
+                parts.append(f"{name} (no price yet)")
+                continue
+            pnl = (price - p.entry_price) * 100 * p.qty_open
+            total += pnl
+            priced += 1
+            parts.append(f"{name} {(price / p.entry_price - 1) * 100:+.1f}% ({_usd(pnl)}{note})")
+        if not parts:
+            return "holding 0"
+        return (f"holding {len(parts)}: " + "; ".join(parts)
+                + (f" | open P&L {_usd(total)}" if priced > 1 else ""))
+
     def buys_today(self):
         return sum(1 for r in self._rows_today() if r.get("decision") in ("WOULD BUY", "BOUGHT"))
 
@@ -1578,7 +1615,7 @@ class Engine:
                            + (f"; {typo_note}" if typo_note else ""))
                 self.log(row)
                 self.notify(f"HOLD runner {pos.contract}: he sold {a.fraction} more. The runner is sold when he is "
-                            f"fully out, or if its mid falls back to your buy price {pos.entry_price:g}.")
+                            f"fully out, or {self._runner_stop_text(pos)}.")
                 return ("HOLD", pos.contract)
             row.update(decision="HOLD", reason=f"{target} of {pos.qty_orig} rounds to 0 more - holding"
                        + (f"; {typo_note}" if typo_note else ""))
@@ -1594,8 +1631,14 @@ class Engine:
     def _runner_kept(self, pos):
         """Say so once the first of a runner's 2 contracts has been sold."""
         if any(p is pos for p in self.positions) and pos.runner_left and not pos.exit_wanted:
-            self._notify(f"RUNNER kept: 1x {pos.contract}. It is sold when he is fully out, or if its mid falls back "
-                         f"to your buy price {pos.entry_price:g}.")
+            self._notify(f"RUNNER kept: 1x {pos.contract}. It is sold when he is fully out, or "
+                         f"{self._runner_stop_text(pos)}.")
+
+    def _runner_stop_text(self, pos):
+        if pos.locked:
+            return (f"if the bid falls back to {pos.entry_price * (1 + self.s.lock_at_pct / 100):.2f} "
+                    f"(profit lock, +{self.s.lock_at_pct:g}%)")
+        return f"if its mid falls back to your buy price {pos.entry_price:g}"
 
     def _close_live(self, pos, qty, row, his_price, why, q):
         """One attempt to sell for real. If it doesn't fill, the position stays flagged
@@ -1685,9 +1728,13 @@ class Engine:
 
     def check_stops(self, now):
         """Automatic exits, checked every ~10 s on each open position:
-        - take profit: the BID is more than TAKE_PROFIT_PCT above what we paid (a price we can really sell at).
-          With a runner it sells only the first of the 2 contracts; the runner itself has no take-profit;
-        - runner stop: once only the runner is left, sell it if the MID falls back to what we paid;
+        - profit lock (LOCK_PROFIT, the default): once the BID is more than TAKE_PROFIT_PCT above what we paid,
+          nothing is sold - the stop moves up to +LOCK_AT_PCT and his sells decide the exit. If the bid falls
+          back to that level, everything left is sold (a fast drop between two checks can fill a little lower);
+        - take profit (LOCK_PROFIT=false): sell as soon as the bid is more than TAKE_PROFIT_PCT above what we
+          paid. With a runner it sells only the first of the 2 contracts; the runner itself has no take-profit;
+        - runner stop: once only the runner is left (and no profit lock), sell it if the MID falls back to
+          what we paid;
         - disaster stop: the MID has fallen DISASTER_STOP_PCT below what we paid. He often posts no
           exit on losers, so without this a loser can ride to zero."""
         stop_pct, tp_pct = self.s.disaster_stop_pct, self.s.take_profit_pct
@@ -1697,7 +1744,7 @@ class Engine:
             if pos.qty_open <= 0 or pos.exit_wanted:
                 continue
             runner_left = pos.runner_left
-            if stop_pct <= 0 and tp_pct <= 0 and not runner_left:
+            if stop_pct <= 0 and tp_pct <= 0 and not runner_left and not pos.locked:
                 continue
             last = self._stop_checked.get(pos.contract)
             if last and (now - last).total_seconds() < self.s.exit_check_sec:
@@ -1706,13 +1753,34 @@ class Engine:
             q = self.quotes(pos.ticker, date.fromisoformat(pos.exp), pos.strike, pos.cp)
             if not q:
                 continue
+            self._marks[pos.contract] = q
             bid = q.get("bid")
-            if tp_pct > 0 and not runner_left and bid and bid > pos.entry_price * (1 + tp_pct / 100):
-                row = {"alert_time": "", "raw": "(take profit)", "action": "TAKE_PROFIT", "contract": pos.contract}
-                why = f"take profit: bid {bid:g} is {(bid / pos.entry_price - 1) * 100:+.0f}% over our {pos.entry_price:g}"
-                self._close(pos, 1 if pos.runner else pos.qty_open, row, his_price=None,
-                            why=why + ("; 1 of 2 sold, runner kept" if pos.runner else ""))
+            floor = round(pos.entry_price * (1 + self.s.lock_at_pct / 100), 4)
+            if pos.locked:
+                if bid is not None and bid <= floor:
+                    row = {"alert_time": "", "raw": "(profit lock)", "action": "PROFIT_LOCK", "contract": pos.contract}
+                    self._close(pos, pos.qty_open, row, his_price=None,
+                                why=f"profit lock: bid {bid:g} fell back to {floor:.2f}, +{self.s.lock_at_pct:g}% "
+                                    f"over our {pos.entry_price:g}")
                 continue
+            if tp_pct > 0 and bid and bid > pos.entry_price * (1 + tp_pct / 100):
+                pct = f"{(bid / pos.entry_price - 1) * 100:+.0f}%"
+                if self.s.lock_profit:
+                    pos.locked = True
+                    self.save_state()
+                    self.log({"alert_time": "", "raw": "(profit lock on)", "action": "PROFIT_LOCK",
+                              "contract": pos.contract, "bid": bid, "ask": q.get("ask"), "decision": "LOCKED",
+                              "reason": f"bid {bid:g} is {pct} over our {pos.entry_price:g}: holding for his exit, "
+                                        f"sold if the bid falls back to {floor:.2f}"})
+                    self.notify(f"LOCKED {pos.contract}: bid {bid:g} is {pct} over our {pos.entry_price:g}. Holding for "
+                                f"his exit; sold if the bid falls back to {floor:.2f} (+{self.s.lock_at_pct:g}%).")
+                    continue
+                if not runner_left:
+                    row = {"alert_time": "", "raw": "(take profit)", "action": "TAKE_PROFIT", "contract": pos.contract}
+                    why = f"take profit: bid {bid:g} is {pct} over our {pos.entry_price:g}"
+                    self._close(pos, 1 if pos.runner else pos.qty_open, row, his_price=None,
+                                why=why + ("; 1 of 2 sold, runner kept" if pos.runner else ""))
+                    continue
             ref = q.get("mark")
             if ref is None and bid is not None and q.get("ask") is not None:
                 ref = (bid + q["ask"]) / 2
@@ -1880,6 +1948,7 @@ class Robinhood:
     def _parse(d):
         f = lambda k: float(d[k]) if d.get(k) not in (None, "") else None
         return {"bid": f("bid_price"), "ask": f("ask_price"), "mark": f("mark_price"),
+                "last": f("last_trade_price"),
                 "iv": f("implied_volatility"), "delta": f("delta"), "volume": f("volume")}
 
     def quote_many(self, items):
@@ -2415,9 +2484,8 @@ async def run():
                     last_beat = now
                     la = status["last_alert"]
                     mode = "LIVE" if broker else "shadow"
-                    held = len([p for p in engine.positions if p.qty_open > 0])
                     cap = f" | capital ${engine.capital_left():,.0f}" if broker else ""
-                    print(f"[{now:%H:%M:%S}] alive | {mode} | holding {held}{cap} | Telegram "
+                    print(f"[{now:%H:%M:%S}] alive | {mode} | {engine.positions_line()}{cap} | Telegram "
                           f"{'connected' if client.is_connected() else 'DISCONNECTED'}"
                           f" | tracking {len(tracker.active())} contracts"
                           f"{f' | watching {len(engine.watching)}' if engine.watching else ''}"
@@ -2453,7 +2521,7 @@ def selftest():
 
     s = Settings()
 
-    s.keep_runner = False          # 1 contract per alert here (runner: selftest_runner)
+    s.keep_runner, s.lock_profit = False, False    # the older rules here (runner, profit lock: own checks)
     eng = Engine(s, quotes, notify=lambda t: print("   ->", t), now=lambda: clock["t"],
                  log_path=os.path.join(tmp, "log.csv"), state_path=os.path.join(tmp, "s.json"))
 
@@ -2508,6 +2576,7 @@ def selftest():
     selftest_entry_rules()
     selftest_failures()
     selftest_runner()
+    selftest_lock()
 
 
 class _FakeAPI:
@@ -2580,7 +2649,7 @@ def selftest_watch():
     clock = {"t": datetime(2026, 10, 6, 10, 0, 0, tzinfo=ET)}
     book, notes = {}, []
     s = Settings()
-    s.keep_runner = False          # 1 contract per alert here (runner: selftest_runner)
+    s.keep_runner, s.lock_profit = False, False    # the older rules here (runner, profit lock: own checks)
     s.max_deployed, s.max_open_positions, s.max_buys_per_day = 5000, 10, 20
     s.max_single_contract_cost, s.project_capital = 1000, 5000
 
@@ -2776,7 +2845,7 @@ def selftest_entry_rules():
     clock = {"t": datetime(2026, 10, 6, 10, 0, 0, tzinfo=ET)}
     book, notes = {}, []
     s = Settings()
-    s.keep_runner = False          # 1 contract per alert here (runner: selftest_runner)
+    s.keep_runner, s.lock_profit = False, False    # the older rules here (runner, profit lock: own checks)
     s.max_deployed, s.max_open_positions, s.max_buys_per_day = 5000, 20, 50
     s.max_single_contract_cost, s.project_capital = 1000, 5000
 
@@ -2920,7 +2989,7 @@ def selftest_failures():
     clock = {"t": datetime(2026, 10, 6, 10, 0, 0, tzinfo=ET)}
     book, notes = {}, []
     s = Settings()
-    s.keep_runner = False          # 1 contract per alert here (runner: selftest_runner)
+    s.keep_runner, s.lock_profit = False, False    # the older rules here (runner, profit lock: own checks)
     s.max_deployed, s.max_open_positions, s.max_buys_per_day = 5000, 20, 50
     s.max_single_contract_cost, s.project_capital = 1000, 5000
 
@@ -3061,11 +3130,17 @@ def selftest_runner():
     book, notes = {}, []
     s = Settings()
     s.keep_runner, s.max_single_contract_cost, s.max_deployed, s.project_capital = True, 500, 5000, 5000
+    s.lock_profit = False          # these checks use the plain take-profit; the lock has its own
     s.max_open_positions, s.max_buys_per_day, s.take_profit_pct, s.disaster_stop_pct = 20, 50, 40, 50
 
-    def quotes(ticker, exp, strike, cp):
+    def quotes(ticker, exp, strike, cp):           # book: (bid, ask) or (bid, ask, last trade, volume today)
         b = book.get(ticker)
-        return {"bid": b[0], "ask": b[1], "mark": round((b[0] + b[1]) / 2, 3)} if b else None
+        if not b:
+            return None
+        q = {"bid": b[0], "ask": b[1], "mark": round((b[0] + b[1]) / 2, 3)}
+        if len(b) > 2:
+            q.update(last=b[2], volume=b[3])
+        return q
 
     api = _FakeAPI()
 
@@ -3212,7 +3287,156 @@ def selftest_runner():
     r = feed("SOLD 1/2 RNP 100C 10/16 2.6", paper)
     check("paper mode: his first trim -> WOULD SELL 1, runner kept",
           r[0][0] == "WOULD SELL" and r[0][2] == 1 and pos("RNP", paper).runner_left, str(r[0]))
+    clock["t"] += timedelta(seconds=11)
+    paper.tick()
+    check("status line marks a runner", "1x RNP 100C 10/16 runner +" in paper.positions_line(), paper.positions_line())
+
+    # --- the status line shows each open position's profit or loss ------------------------------
+    st = Engine(s, quotes, lambda x: None, now=lambda: clock["t"], log_path=os.path.join(tmp, "st_log.csv"),
+                state_path=os.path.join(tmp, "st.json"), stop_file=os.path.join(tmp, "STOP_TRADING"))
+    check("status line with nothing open", st.positions_line() == "holding 0", st.positions_line())
+    book["STA"], book["STB"] = (1.95, 2.00), (3.95, 4.00)
+    feed("BOUGHT STA 100C 10/16 2.0", st)
+    feed("BOUGHT STB 100C 10/16 4.0", st)
+    check("before the first price check it says so", "(no price yet)" in st.positions_line(), st.positions_line())
+    book["STA"], book["STB"] = (2.15, 2.25, 2.30, 120), (3.45, 3.55, 3.50, 40)    # mids 2.20 / 3.50
+    clock["t"] += timedelta(seconds=11)
+    st.tick()
+    line = st.positions_line()
+    check("shows each position's % and $ at the last traded price, and the total",
+          line == "holding 2: 2x STA 100C 10/16 +15.0% (+$60); 1x STB 100C 10/16 -12.5% (-$50) | open P&L +$10", line)
+    book["STA"], book["STB"] = (2.15, 2.25, 2.30, 0), (3.45, 3.55)
+    clock["t"] += timedelta(seconds=11)
+    st.tick()
+    line = st.positions_line()
+    check("no volume today: says the last trade is old", "2x STA 100C 10/16 +15.0% (+$60, no trade today)" in line, line)
+    check("no last trade at all: uses the mid and says so", "1x STB 100C 10/16 -12.5% (-$50, mid)" in line, line)
     print("\n  all runner checks passed")
+
+
+def selftest_lock():
+    """Profit lock: past +40% nothing is sold - the stop moves up to +40% and his sells decide the exit."""
+    import tempfile
+    print("\n\n========== profit lock: past +40%, hold for his exit, sell if it falls back to +40% ==========")
+    tmp = tempfile.mkdtemp()
+    clock = {"t": datetime(2026, 10, 6, 10, 0, 0, tzinfo=ET)}
+    book, notes = {}, []
+    s = Settings()
+    s.keep_runner, s.lock_profit, s.take_profit_pct, s.lock_at_pct = False, True, 40, 40
+    s.max_single_contract_cost, s.max_deployed, s.project_capital, s.disaster_stop_pct = 1000, 5000, 5000, 50
+    s.max_open_positions, s.max_buys_per_day = 20, 50
+
+    def quotes(ticker, exp, strike, cp):
+        b = book.get(ticker)
+        return {"bid": b[0], "ask": b[1], "mark": round((b[0] + b[1]) / 2, 3)} if b else None
+
+    api = _FakeAPI()
+
+    def build():
+        brk = Broker(api, s, lambda x: None, orders_csv=os.path.join(tmp, "orders.csv"), sleep=lambda x: None,
+                     now=lambda: clock["t"])
+        return Engine(s, quotes, lambda x: notes.append(x), now=lambda: clock["t"],
+                      log_path=os.path.join(tmp, "log.csv"), state_path=os.path.join(tmp, "s.json"),
+                      broker=brk, stop_file=os.path.join(tmp, "STOP_TRADING"))
+
+    eng = build()
+
+    def feed(text):
+        clock["t"] += timedelta(seconds=3)
+        notes.clear()
+        return eng.handle_message(text, clock["t"] - timedelta(seconds=2))
+
+    def tick(sec=11):
+        clock["t"] += timedelta(seconds=sec)
+        notes.clear()
+        eng.tick()
+
+    def check(label, cond, detail=""):
+        print(f"  {'PASS' if cond else 'FAIL'}  {label}  {detail}")
+        assert cond, label
+
+    def pos(ticker, e=None):
+        return next((p for p in (e or eng).positions if p.ticker == ticker and p.qty_open > 0), None)
+
+    def last_log():
+        with open(eng.log_path, encoding="utf-8-sig") as f:
+            return list(csv.DictReader(f))[-1]
+
+    check("the lock level defaults to the take-profit level", Settings().lock_at_pct == Settings().take_profit_pct)
+
+    # --- one contract: bought at 2.05 (ask + 1 step), so +40% is 2.87 ---------------------------
+    book["LKA"] = (1.95, 2.00)
+    feed("BOUGHT LKA 100C 10/16 2.0")
+    book["LKA"] = (2.95, 3.00)
+    tick()
+    check("bid crosses +40%: nothing sold, the profit lock goes on", pos("LKA") and pos("LKA").locked)
+    check("...you are told, and it is logged", any("LOCKED LKA" in n for n in notes)
+          and last_log()["decision"] == "LOCKED", str(notes))
+    book["LKA"] = (3.40, 3.50)
+    tick()
+    check("keeps holding while it climbs (+66%)", pos("LKA") is not None)
+    book["LKA"] = (2.90, 2.95)
+    tick()
+    check("bid just above the lock level (2.90): still held", pos("LKA") is not None)
+    pot = eng.live_realized
+    book["LKA"] = (2.85, 2.95)
+    tick()
+    check("bid back under +40% (2.85): sold by the profit lock",
+          pos("LKA") is None and any("profit lock" in n for n in notes), str(notes))
+    check("...at the bid: +$80", abs(eng.live_realized - pot - 80) < 0.01, str(eng.live_realized - pot))
+
+    book["LKB"] = (1.95, 2.00)
+    feed("BOUGHT LKB 100C 10/16 2.0")
+    book["LKB"] = (2.95, 3.00)
+    tick()
+    book["LKB"] = (3.40, 3.50)
+    r = feed("ALL OUT LKB 100C 10/16 3.45")
+    check("locked, then his ALL OUT: sold on his alert at 3.40", r[0][0] == "SOLD" and pos("LKB") is None
+          and abs(r[0][3] - 3.40) < 1e-9, str(r[0]))
+
+    book["LKC"] = (1.95, 2.00)
+    feed("BOUGHT LKC 100C 10/16 2.0")
+    book["LKC"] = (2.95, 3.00)
+    tick()
+    book["LKC"] = (2.40, 2.50)                       # dropped straight through the lock level
+    tick()
+    check("a drop straight past +40% sells at the bid it finds (2.40, +17%)",
+          pos("LKC") is None and api.placed[-1] == ("sell", 2.4), str(api.placed[-1]))
+
+    # --- with a runner -------------------------------------------------------------------------------
+    s.keep_runner, s.max_single_contract_cost = True, 500
+    book["LKR"] = (1.95, 2.00)
+    r = feed("BOUGHT LKR 100C 10/16 2.0")
+    check("runner bought (2 contracts)", r[0][2] == 2, str(r[0]))
+    book["LKR"] = (2.95, 3.00)
+    tick()
+    check("crosses +40%: both locked, nothing sold", pos("LKR").locked and pos("LKR").qty_open == 2)
+    r = feed("SOLD 1/4 LKR 100C 10/16 3.0")
+    check("his first trim still sells 1 of the 2", r[0][0] == "SOLD" and r[0][2] == 1 and pos("LKR").runner_left,
+          str(r[0]))
+    check("...and the runner's stop is now the lock, not the buy price",
+          any("RUNNER kept" in n and "profit lock" in n for n in notes), str(notes))
+    book["LKR"] = (2.85, 2.95)
+    tick()
+    check("runner back under +40%: sold by the profit lock", pos("LKR") is None, str(notes))
+    s.keep_runner, s.max_single_contract_cost = False, 1000
+
+    # --- status line, restart, switching it off -------------------------------------------------------
+    book["LKS"] = (1.95, 2.00)
+    feed("BOUGHT LKS 100C 10/16 2.0")
+    book["LKS"] = (2.95, 3.00)
+    tick()
+    check("status line shows the lock", "1x LKS 100C 10/16 [lock +40%] +" in eng.positions_line(),
+          eng.positions_line())
+    check("the lock survives a restart", pos("LKS", build()).locked)
+    s.lock_profit = False
+    book["LKT"] = (1.95, 2.00)
+    feed("BOUGHT LKT 100C 10/16 2.0")
+    book["LKT"] = (2.95, 3.00)
+    tick()
+    check("LOCK_PROFIT=false: sells at +40% straight away, as before", pos("LKT") is None)
+    s.lock_profit = True
+    print("\n  all profit-lock checks passed")
 
 
 def selftest_live():
@@ -3226,7 +3450,7 @@ def selftest_live():
     book = {}                                    # ticker -> (bid, ask)
     notes = []
     s = Settings()
-    s.keep_runner = False          # 1 contract per alert here (runner: selftest_runner)
+    s.keep_runner, s.lock_profit = False, False    # the older rules here (runner, profit lock: own checks)
     s.max_buys_per_day, s.disaster_stop_pct, s.partial_rounding = 6, 50, "nearest"
 
     def quotes(ticker, exp, strike, cp):
@@ -3463,7 +3687,7 @@ def selftest_exit_typos():
 
     s = Settings()
 
-    s.keep_runner = False          # 1 contract per alert here (runner: selftest_runner)
+    s.keep_runner, s.lock_profit = False, False    # the older rules here (runner, profit lock: own checks)
     tr = Tracker(s, qmany, lambda tk: {}, now=lambda: clock["t"], path_csv=os.path.join(tmp, "p.csv"),
                  save=lambda: None, notify=lambda x: None)
     eng = Engine(s, q1, lambda x: print("   ->", x), now=lambda: clock["t"],
@@ -3551,7 +3775,7 @@ def selftest_tracker():
 
     def build():
         s = Settings()
-        s.keep_runner = False          # 1 contract per alert here (runner: selftest_runner)
+        s.keep_runner, s.lock_profit = False, False    # the older rules here (runner, profit lock: own checks)
         tr = Tracker(s, qmany, under, now=lambda: clock["t"], path_csv=os.path.join(tmp, "paths.csv"),
                      save=lambda: None, notify=lambda x: print("   ->", x))
         eng = Engine(s, q1, lambda x: None, now=lambda: clock["t"], log_path=os.path.join(tmp, "log.csv"),
