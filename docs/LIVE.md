@@ -35,7 +35,7 @@ that use them.
    - In Telegram, message **@BotFather**, send `/newbot`, follow the prompts, copy the token into `TG_BOT_TOKEN`.
    - Open your new bot and send it any message.
    - In a browser open `https://api.telegram.org/bot<TOKEN>/getUpdates` and copy the number after `"chat":{"id":` into `TG_NOTIFY_CHAT_ID`.
-5. Run `python .\sniper-bot\sniper_shadow.py --selftest` and check it ends with "all runner checks passed".
+5. Run `python .\sniper-bot\sniper_shadow.py --selftest` and check it ends with "ALL SELF-TESTS PASSED" (a failed check stops it early with a FAIL line).
 
 ## Each live morning
 1. About 9:15, start the bot as usual. It asks you to type `LIVE`, then checks your Robinhood login, buying power and open positions and says **LIVE mode started**. Buys go out from then on.
@@ -47,8 +47,10 @@ that use them.
 - **Back to paper mode:** set `LIVE_TRADING=false` and restart.
 
 ## If you see
-- `!! NOT SOLD YET` - the exit hasn't filled; it keeps retrying lower. If it repeats, sell by hand in Robinhood.
-- `!! ... STATE UNKNOWN` - the bot could not confirm an order's final state. New buys are halted. Open Robinhood and check or cancel the order, then restart the bot.
+- `!! NOT SOLD YET` - the exit hasn't filled; it keeps retrying lower. If it repeats, sell by hand in Robinhood. With 2 contracts it may say `1 of your 2`: then sell only 1 by hand - the bot keeps the other (the runner). It checks Robinhood before every retry, so if you do it notices (`Robinhood shows 1 left ... sold outside the bot`) and stops selling; that sale is not counted in the pot.
+- `!! ... STATE UNKNOWN` - the bot could not confirm an order's final state. New buys are halted. For a sell, no other sell goes out for that contract until Robinhood confirms how that order ended: the bot keeps asking, books it if it filled (`now confirmed: filled`) and sells again only if it didn't. Open Robinhood and check or cancel the order - don't sell by hand until it shows cancelled there - then restart the bot to resume buying.
+- `SECOND LOOK ...` - an alert read late or at start-up: the bot looks again ~15 s later and buys then only if every rule still passes and he hasn't sold it. Start-up messages are quiet, so you may only see the BOUGHT card.
+- `RUNNER: ... already at or below your buy price` - his first sell came below what we paid, so the runner stop sells the second contract at the next check (within ~10 s).
 - `Start-up check: ...` - the bot compared its books with Robinhood and found a difference. It never touches positions it didn't buy.
 - `!! <contract>: Robinhood refused the sell twice ... removed from the bot's books` - Robinhood no longer shows that position, usually because you sold it by hand. The bot stops trying to sell it. Its profit or loss is not counted in the pot.
 - `!! Unexpected error in ...` - something went wrong inside the bot, but it kept running. Check Robinhood; the details are in the bot's window. Restart the bot if it repeats.

@@ -124,6 +124,7 @@ ORDERS_CSV = lambda: run_file("orders_log.csv")         # every REAL order sent,
 STALLS_CSV = lambda: run_file("stalls.csv")             # any freeze longer than a minute (daily)
 STATE_JSON = os.path.join(DATA_DIR, "state.json")       # memory between restarts (positions, pot, watches)
 STOP_FILE = os.path.join(HERE, "STOP_TRADING")          # create this file = no new buys (exits still work)
+CATCHUP_TIMEOUT_SEC = 60        # the start-up read of missed messages gives up after this long (live alerts wait for it)
 OLD_LAYOUT_FILES = ["paper_positions.json", "robinhood.pickle", "sniper_session.session",
                     "trades_log.csv", "price_paths.csv", "orders_log.csv", "stalls.csv"]
 
@@ -452,6 +453,10 @@ class Position:
     exit_attempts: int = 0
     exit_refused: int = 0     # sell orders in a row that Robinhood refused outright
     exit_why: str = ""
+    exit_his_price: float = 0.0   # his price on the sell being retried (for the card and his P&L)
+    exit_noquote: int = 0     # sell attempts that couldn't be priced (no quote) - counted for messages, not price steps
+    exit_order: str = ""      # a sell order whose final state we couldn't confirm: never sell again until resolved
+    exit_order_why: str = ""  # why that order was sent (for its card when it is confirmed)
     runner: bool = False      # 2 contracts: the first sold at his first sell or +TAKE_PROFIT_PCT, the runner later
     first_out: str = ""       # what sold a runner's first contract: "his" (his first sell) or "target" (+TAKE_PROFIT_PCT)
 
@@ -733,9 +738,11 @@ def _ago(sec):
     return f"{sec:.0f} s" if sec < 120 else f"{sec / 60:.0f} min"
 
 
-def buy_message(verb, qty, contract, our_price, his_price, lotto=False, delay=None, watched=False, runner=False):
+def buy_message(verb, qty, contract, our_price, his_price, lotto=False, delay=None, watched="", runner=False,
+                tp_pct=40.0):
     """A small card for Telegram: what we paid next to what he paid. First line is the title;
-    the rest is a table meant for a monospaced font."""
+    the rest is a table meant for a monospaced font. watched = the kind of watch it came from
+    ("price", "spread" or "late" = the second look at a late / start-up alert), "" if none."""
     diff = (our_price / his_price - 1) * 100 if his_price else 0.0
     rule = " " + "-" * 40
     lines = [f"🟢 {verb}  {contract}" + ("  [LOTTO]" if lotto else ""),
@@ -745,8 +752,11 @@ def buy_message(verb, qty, contract, our_price, his_price, lotto=False, delay=No
              f" {'He paid':<10}{his_price:>8.2f}",
              f" {'Cost':<10}{'$' + format(qty * our_price * 100, ',.0f'):>8}   ({qty} contract{'s' if qty != 1 else ''})"]
     if runner:
-        lines.append(f" {'Plan':<10}1 sold at his first trim, 1 runner kept until he is fully out")
-    if watched:
+        first = f"his first sell or +{tp_pct:g}%, whichever first" if tp_pct > 0 else "his first sell"
+        lines.append(f" {'Plan':<10}1 sold at {first}; 1 runner kept (its rules are sent then)")
+    if watched == "late":
+        lines.append(f" {'Timing':<10}late entry, bought after a second look ({_ago(delay)} after his alert)")
+    elif watched:
         lines.append(f" {'Timing':<10}bought after watching the price ({_ago(delay)} after his alert)")
     elif delay is not None and delay > 60:
         lines.append(f" {'Timing':<10}late entry ({_ago(delay)} after his alert)")
@@ -767,6 +777,8 @@ def sell_message(verb, qty, contract, our_price, our_entry, his_price, his_entry
         lines.append(f" {'Him':<6}{his_entry:>8.2f}{his_price:>8.2f}   {_usd(his_pnl)} ({his_pct:+.0f}%)")
         lines.append(rule)
         lines.append(f" We sold {abs(gap):.1f}% {'above' if gap >= 0 else 'below'} his price. {left} left.")
+        if why.strip() and not why.strip().startswith("his"):
+            lines.append(f" Our exit: {why.strip()}")
     else:
         lines.append(f" {'Him':<6}{his_entry:>8.2f}{'--':>8}   has not sold")
         lines.append(rule)
@@ -1059,8 +1071,11 @@ class Engine:
                "bucket": expiry_bucket(a.exp, alert_time.date())[0],
                "decision": "CHECK", "reason": f"possible typo of his open {names} - {why}; NOT applied"}
         self.log(row)
-        self.notify(f"!! CHECK: exit alert '{a.raw}' doesn't match anything he holds, but may mean {names}. "
-                    f"{why}. Not applied.")
+        # about a contract we hold: always sent, even while catching up on missed alerts (quiet mode)
+        held = {(p.ticker, p.strike, p.cp, p.exp) for p in self.positions if p.qty_open > 0}
+        send = self._notify if any(tuple(c) in held for c in cands) else self.notify
+        send(f"!! CHECK: exit alert '{a.raw}' doesn't match anything he holds, but may mean {names}. "
+             f"{why}. Not applied.")
         if self.tracker:
             for tk, k, cp, ex in cands:
                 t = self.tracker.items.get(contract_key(tk, k, cp, date.fromisoformat(ex)))
@@ -1113,13 +1128,18 @@ class Engine:
             else:
                 status, alert, fix_note, cands = self.resolve_exit(alert, alert_time, source)
                 if status == "check":
+                    # a possible sell of his (a typo we can't confirm) still cancels a pending buy of those contracts
+                    for tk, k, cp, ex in cands:
+                        self._end_watch(contract_key(tk, k, cp, date.fromisoformat(ex)),
+                                        "possible sell of his (unconfirmed typo) - not bought")
                     result = self.on_exit_check(alert, alert_time, cands, fix_note)
                 else:
                     self._end_watch(contract_key(alert.ticker, alert.strike, alert.cp, alert.exp),
                                     "he sold before we bought")
                     if self.tracker:
                         self.tracker.his_sell(alert, alert_time, source, typo_note=fix_note)
-                    result = self.on_sell(alert, alert_time, fix_note=fix_note)
+                    result = self.on_sell(alert, alert_time, fix_note=fix_note,
+                                          his_exact=status in ("exact", "fixed"))
             out.append(result)
             # remember the last real alert, so a correction can point back to it
             self.last_alert = {"raw": raw, "time": f"{alert_time:%H:%M:%S}",
@@ -1150,11 +1170,13 @@ class Engine:
         delay = (now - alert_time).total_seconds()
         row = {"alert_time": f"{alert_time:%m/%d %H:%M:%S}", "delay_sec": f"{delay:.1f}",
                "raw": a.raw, "action": "BUY", "contract": a.contract, "his_price": a.price,
-               "bucket": expiry_bucket(a.exp, alert_time.date())[0], "_watched": from_watch}
+               "bucket": expiry_bucket(a.exp, alert_time.date())[0], "_watched": ""}
 
         def skip(reason, transient=False):
-            if from_watch and transient:
-                return ("WAIT", a.contract, reason)      # still being watched: stay quiet, try again
+            # a price or spread watch stays quiet and tries again; a 'late' second look gets exactly one try,
+            # like a live alert would
+            if from_watch and transient and kind != "late":
+                return ("WAIT", a.contract, reason)
             if from_watch:
                 reason += " [watch ended]"
                 self.watching.pop(key, None)
@@ -1164,12 +1186,17 @@ class Engine:
             return ("SKIP", a.contract, reason)
 
         key = contract_key(a.ticker, a.strike, a.cp, a.exp)
+        kind = self.watching.get(key, {}).get("kind") if from_watch else None   # price | spread | late
+        row["_watched"] = kind or ""
         if key in self.his_shorts:
             return skip("he is buying back his own short (CSP / covered call) - not a new long")
         self.seen_buys.add(key)
         self.save_state()
         if key in self.watching and not from_watch:
-            return skip("already watching this contract for a better price")
+            return skip({"late": "already taking a second look at this alert - bought in a few seconds if every rule "
+                                 "still passes",
+                         "spread": "already re-checking the spread on this contract"}.get(
+                self.watching[key].get("kind"), "already watching this contract for a better price"))
         # Read at start-up (posted while the bot was off or still starting): treated like a late live alert -
         # bought only within the late-entry limit for its expiry, after a second look 15 s later (below)
         catch_up = source != "live"
@@ -1247,17 +1274,17 @@ class Engine:
         cap = round(a.price * (1 + self.s.entry_cap_pct / 100), 2)
         if spread_pct > self.s.max_spread_pct:
             why = f"spread {spread_pct:.0f}% > {self.s.max_spread_pct:g}%"
-            if not from_watch and self.s.spread_recheck_sec > 0:
+            if (not from_watch or kind == "late") and self.s.spread_recheck_sec > 0:
                 return self._start_watch(a, alert_time, key, row, why, kind="spread",
                                          until=now + timedelta(seconds=self.s.spread_recheck_sec))
             return skip(why, transient=True)
         if ask > cap:
             why = f"ask {ask} above cap {cap} (+{(ask / a.price - 1) * 100:.0f}% vs his {a.price})"
-            # a new alert, or a spread re-check whose spread has narrowed but whose ask is above the cap
-            # a new alert, or a spread re-check / late re-check that now only fails on the cap: watch it
-            if self._can_watch(a, now) and (not from_watch or self.watching.get(key, {}).get("kind") in ("spread", "late")):
+            # a new alert, or a spread re-check / late re-check that now only fails on the cap: watch it - if this
+            # option may be watched at all (never same-day). Only a running price watch keeps waiting.
+            if self._can_watch(a, now) and (not from_watch or kind in ("spread", "late")):
                 return self._start_watch(a, alert_time, key, row, why)
-            return skip(why, transient=True)
+            return skip(why, transient=kind == "price")
         floor = a.price * (1 - self.s.entry_floor_pct / 100)
         if ask < floor:
             # Far CHEAPER than his price is not a bargain - it usually means a typo
@@ -1298,7 +1325,8 @@ class Engine:
                    reason=f"limit {cap}; paying {slip:+.1f}% vs his price" + ("; LOTTO" if lotto else "")
                           + ("; RUNNER" if runner else ""))
         self.log(row)
-        self.notify(buy_message("WOULD BUY", qty, a.contract, ask, a.price, lotto, delay, from_watch, runner))
+        self.notify(buy_message("WOULD BUY", qty, a.contract, ask, a.price, lotto, delay, row["_watched"], runner,
+                                self.s.take_profit_pct))
         if self.watchlist:
             self.watchlist(a.ticker)
         return ("WOULD BUY", a.contract, qty, ask)
@@ -1336,6 +1364,12 @@ class Engine:
                       f"every other rule still passes, unless he sells first")
             text = (f"RE-CHECKING {a.contract} (his {a.price}): {why}. Will buy if the spread narrows within "
                     f"{self.s.spread_recheck_sec:g} s, unless he sells first.")
+        elif kind == "late":
+            at = f"{first_check:%H:%M:%S}" if first_check else "once"
+            reason = (f"{why}. SECOND LOOK at {at}: buys if every rule still passes and he hasn't sold "
+                      f"(by {until:%H:%M:%S} at the latest)")
+            text = (f"SECOND LOOK {a.contract} (his {a.price}): {why}. Looking again at {at}: bought then if every "
+                    f"rule still passes and he hasn't sold it.")
         else:
             mins = (until - alert_time).total_seconds() / 60
             reason = (f"{why}. WATCHING until {until:%H:%M} ({mins:.0f} min after his alert): buys once the ask "
@@ -1373,6 +1407,9 @@ class Engine:
                 if rec.get("kind") == "spread":
                     why = (f"re-checked for {self.s.spread_recheck_sec:g} s and it never qualified "
                            f"(last check: {rec.get('last') or 'spread still too wide'})")
+                elif rec.get("kind") == "late":
+                    why = (f"the late-entry window passed before the second look "
+                           f"({rec.get('last') or 'not checked in time - bot busy or PC asleep'})")
                 else:
                     why = (f"{(until - alert_time).total_seconds() / 60:.0f} minutes passed and it never qualified "
                            f"(last check: {rec.get('last') or 'ask above the cap'})")
@@ -1396,7 +1433,9 @@ class Engine:
                 rec["last"] = res[2]
             elif res[0] == "NOT FILLED":
                 rec["tries"] = rec.get("tries", 0) + 1
-                if rec["tries"] >= self.s.watch_max_tries:
+                if rec.get("kind") == "late":           # one second look, like a live alert: no re-tries
+                    self._end_watch(key, "the buy order at the second look did not fill")
+                elif rec["tries"] >= self.s.watch_max_tries:
                     self._end_watch(key, f"{rec['tries']} buy orders did not fill")
                 else:
                     self.save_state()
@@ -1458,7 +1497,8 @@ class Engine:
                           + (f"; only {res.qty} of {qty} filled" if res.qty < qty else ""))
         self.log(row)
         self.notify(buy_message("BOUGHT", res.qty, a.contract, fill, a.price, lotto,
-                                float(row.get("delay_sec") or 0), bool(row.get("_watched")), runner))
+                                float(row.get("delay_sec") or 0), row.get("_watched") or "", runner,
+                                self.s.take_profit_pct))
         if self.watchlist:
             self.watchlist(a.ticker)
         return ("BOUGHT", a.contract, res.qty, fill)
@@ -1467,6 +1507,22 @@ class Engine:
         """Run once when live mode starts: clean up orders left open by a crash, then make the
         bot's books match Robinhood's. Returns a list of things to tell you."""
         msgs = []
+        # sells whose final state we couldn't confirm before the restart: book them if they filled
+        for p in list(self.positions):
+            if p.real and p.exit_order:
+                oid, order_why = p.exit_order, p.exit_order_why
+                res = self._check_unknown_sell(p)
+                if res is None:
+                    msgs.append(f"sell order {oid} on {p.contract} is still not confirmed - asked Robinhood to cancel "
+                                f"it again; no other sell goes out for it until it is")
+                elif res.qty > 0:
+                    row = {"alert_time": "", "raw": "(sell confirmed at start-up)", "action": "SELL",
+                           "contract": p.contract}
+                    keep = (p.exit_why, p.exit_his_price)
+                    self._book_sale(p, min(p.exit_wanted, p.qty_open) or res.qty, row, p.exit_his_price or None,
+                                    order_why or p.exit_why or "sell confirmed at start-up", None, res)
+                    if p.exit_wanted and any(x is p for x in self.positions):
+                        p.exit_why, p.exit_his_price = keep
         for oid in list(self.inflight):
             info = self.broker.order_info(oid)
             st = info.get("state")
@@ -1486,12 +1542,12 @@ class Engine:
         if held is not None:
             have = {(t, e, k, c): q for t, e, k, c, q in held}
             for p in list(self.positions):
-                if p.real:
+                if p.real and not p.exit_order:      # an unconfirmed sell explains a gap: it's booked when confirmed
                     n = have.get((p.ticker, p.exp, p.strike, p.cp), 0)
                     if n <= 0:
                         self.positions.remove(p)
                     elif n < p.qty_open:
-                        p.qty_open = n
+                        self._shrink(p, n, tell=False)       # reconcile's message already says so
         self.save_state()
         return msgs
 
@@ -1559,7 +1615,8 @@ class Engine:
         return sum(1 for r in self._rows_today() if r.get("decision") in ("WOULD BUY", "BOUGHT"))
 
     # ---- sells ------------------------------------------------------------
-    def on_sell(self, a: Alert, alert_time: datetime, from_queue=False, fix_note=""):
+    def on_sell(self, a: Alert, alert_time: datetime, from_queue=False, fix_note="", his_exact=False):
+        """his_exact: the alert names a contract he is in (so it's not a typo of one of ours)."""
         now = self.now()
         row = {"alert_time": f"{alert_time:%m/%d %H:%M:%S}",
                "delay_sec": f"{(now - alert_time).total_seconds():.1f}",
@@ -1571,12 +1628,18 @@ class Engine:
             typo_note = f"{typo_note}; {fix_note}".strip("; ") if typo_note else fix_note
         if pos is None:
             misses = self.near_misses(a)
-            if misses:
+            if misses and his_exact:
+                # He sold his own contract that we didn't buy (e.g. a second strike, skipped by one-per-stock):
+                # not a typo of ours, so no "decide by hand" prompt - just a quiet note.
+                held = ", ".join(f"{p.qty_open}x {p.contract}" for p in misses)
+                self.notify(f"Note: he sold {a.contract} - his own contract, which we didn't buy. You hold {held}: "
+                            f"not sold (that is not a sell of it).")
+            elif misses:
                 held = ", ".join(f"{p.qty_open}x {p.contract}" for p in misses)
                 row.update(decision="CHECK", reason=f"possible typo - you hold {held}; not sold automatically")
                 self.log(row)
-                self.notify(f"!! CHECK: he sold {a.contract} but you hold {held}. "
-                            f"Typo? Not sold automatically - decide by hand.")
+                self._notify(f"!! CHECK: he sold {a.contract} but you hold {held}. "      # never muted: we hold it
+                             f"Typo? Not sold automatically - decide by hand.")
                 return ("CHECK", a.contract, held)
             key = contract_key(a.ticker, a.strike, a.cp, a.exp)
             if key not in self.seen_buys and a.action == "SELL" and a.fraction is None:
@@ -1595,7 +1658,9 @@ class Engine:
             return ("IGNORE", a.contract, "not holding")
 
         if not self.market_open(now):
-            self.pending_sells.append({"text": a.raw, "alert_time": alert_time.isoformat()})
+            # keep the contract it was matched to: re-reading the text at the open would bring a typo back
+            self.pending_sells.append({"text": a.raw, "alert_time": alert_time.isoformat(),
+                                       "contract": [pos.ticker, pos.strike, pos.cp, pos.exp], "fix_note": fix_note})
             self.save_state()
             row.update(decision="QUEUED", reason="market closed - will sell at the open")
             self.log(row)
@@ -1614,9 +1679,9 @@ class Engine:
             want_sold = pos.qty_orig                 # he is fully out: so are we, whatever the price
         elif pos.qty_orig == 1:
             want_sold = 1                            # 1 contract: his first sell of any size sells it
-        elif pos.runner and pos.runner_left and pos.first_out == "target":
-            # The take-profit sold the first contract before his first sell: any sell of his also sells the
-            # runner while we're up RUNNER_SELL_PCT or more; below that the runner waits for his ALL OUT.
+        elif pos.runner and pos.first_out == "target":
+            # The take-profit took the first contract (or is still selling it) before his first sell: any sell of
+            # his also sells the runner while we're up RUNNER_SELL_PCT or more; below that it waits for his ALL OUT.
             bid_now = (self.quotes(pos.ticker, date.fromisoformat(pos.exp), pos.strike, pos.cp) or {}).get("bid")
             up = bid_now is not None and bid_now >= pos.entry_price * (1 + self.s.runner_sell_pct / 100)
             want_sold = pos.qty_orig if up else 1
@@ -1631,19 +1696,34 @@ class Engine:
         already_sold = pos.qty_orig - pos.qty_open
         to_sell = min(pos.qty_open, want_sold - already_sold)
         if pos.exit_wanted:                  # an exit is already being worked: don't start a second one
+            pos.exit_his_price = a.price or pos.exit_his_price
+            if to_sell > pos.exit_wanted:     # his sell asks for more than is being sold: say why on the card
+                if target == 1:
+                    pos.exit_why = "his ALL OUT"
+                elif bid_now is not None:
+                    pos.exit_why = (f"his sell with us at {(bid_now / pos.entry_price - 1) * 100:+.0f}% "
+                                    f"(+{self.s.runner_sell_pct:g}% or more): runner sold too")
+                else:
+                    pos.exit_why = "his sell"
             pos.exit_wanted = max(pos.exit_wanted, to_sell)
             self.save_state()
             row.update(decision="PENDING", reason="an exit order for this contract is already being retried")
             self.log(row)
+            if pos.exit_order:
+                self._notify(f"!! {pos.contract}: his {'ALL OUT' if target == 1 else 'sell'} noted, but sell order "
+                             f"{pos.exit_order} is still unconfirmed - nothing more is sold until Robinhood confirms "
+                             f"it. Check or cancel it in Robinhood.")
             return ("PENDING", pos.contract)
 
         if to_sell <= 0:
             self.save_state()
             if pos.runner_left:
-                if pos.first_out == "target":
-                    at = f"{(bid_now / pos.entry_price - 1) * 100:+.0f}%" if bid_now else "unknown (no quote)"
-                    reason = (f"he sold {a.fraction}; we're at {at}, not +{self.s.runner_sell_pct:g}% or more - "
-                              f"runner kept")
+                if pos.first_out == "target" and bid_now is None:
+                    reason = (f"he sold {a.fraction}; no quote right now, so we can't tell if we're "
+                              f"+{self.s.runner_sell_pct:g}% or more - runner kept")
+                elif pos.first_out == "target":
+                    reason = (f"he sold {a.fraction}; bid {bid_now:.2f} is {(bid_now / pos.entry_price - 1) * 100:+.0f}%,"
+                              f" not +{self.s.runner_sell_pct:g}% or more - runner kept")
                 else:
                     reason = f"he sold {a.fraction} more - runner kept until he is fully out"
                 row.update(bid=bid_now, decision="HOLD", reason=reason + (f"; {typo_note}" if typo_note else ""))
@@ -1656,19 +1736,32 @@ class Engine:
             self.notify(f"HOLD {pos.contract}: he sold {a.fraction}, too small to split your {pos.qty_open}")
             return ("HOLD", pos.contract)
 
-        why = ("sold at the open (queued)" if from_queue else "") + (" " + typo_note if typo_note else "")
+        extra = ("; queued, sold at the open" if from_queue else "") + (f"; {typo_note}" if typo_note else "")
         if pos.runner and to_sell < pos.qty_open:
             pos.first_out = pos.first_out or "his"
-            why = f"his first sell: 1 of 2 sold, runner kept {why}"
-        elif pos.runner_left and target < 1:
+            why = f"his first sell: 1 of 2 sold, runner kept{extra}"
+        elif pos.runner_left and target < 1 and bid_now is not None:
             why = (f"his sell with us at {(bid_now / pos.entry_price - 1) * 100:+.0f}% "
-                   f"(+{self.s.runner_sell_pct:g}% or more): runner sold {why}")
+                   f"(+{self.s.runner_sell_pct:g}% or more): runner sold{extra}")
+        else:
+            why = ("his ALL OUT" if target == 1 else "his sell") + extra
         return self._close(pos, to_sell, row, his_price=a.price, why=why)
 
-    def _runner_kept(self, pos):
-        """Say so once the first of a runner's 2 contracts has been sold."""
+    def _runner_kept(self, pos, q=None):
+        """Say so once the first of a runner's 2 contracts has been sold - unless the runner is already at or
+        below our buy price, in which case the runner stop sells it at the next check."""
         if any(p is pos for p in self.positions) and pos.runner_left and not pos.exit_wanted:
-            self._notify(f"RUNNER kept: 1x {pos.contract}. {self._runner_plan(pos)}")
+            if not q and self.market_open(self.now()):        # sold by hand / booked at start-up: no quote passed
+                q = self.quotes(pos.ticker, date.fromisoformat(pos.exp), pos.strike, pos.cp)
+            q = q or {}
+            ref = q.get("mark")
+            if ref is None and q.get("bid") is not None and q.get("ask") is not None:
+                ref = (q["bid"] + q["ask"]) / 2
+            if ref is not None and ref <= pos.entry_price:
+                self._notify(f"RUNNER: 1x {pos.contract} - its mid {ref:g} is already at or below your buy price "
+                             f"{pos.entry_price:g}, so the runner stop sells it at the next check (within ~10 s).")
+            else:
+                self._notify(f"RUNNER kept: 1x {pos.contract}. {self._runner_plan(pos)}")
 
     def _runner_plan(self, pos):
         stop = f"or if its mid falls back to your buy price {pos.entry_price:g}"
@@ -1679,39 +1772,50 @@ class Engine:
 
     def _close_live(self, pos, qty, row, his_price, why, q):
         """One attempt to sell for real. If it doesn't fill, the position stays flagged
-        (exit_wanted) and the timer tries again at a lower price until it is out."""
-        res = self.broker.sell_once(pos.ticker, date.fromisoformat(pos.exp), pos.strike, pos.cp, qty, q,
-                                    pos.exit_attempts, on_order=self._track_order)
+        (exit_wanted) and the timer tries again at a lower price until it is out. A sell whose final state
+        couldn't be confirmed is looked up first: no new sell goes out while it might still fill (two sells
+        could then sell more than intended - e.g. the runner as well as the first contract)."""
+        res = None
+        if pos.exit_order:
+            order_why = pos.exit_order_why
+            res = self._check_unknown_sell(pos)
+            if res is None:                    # still open, or Robinhood didn't answer: wait, cancel again next time
+                return ("SELL PENDING", pos.contract, pos.exit_attempts + pos.exit_refused + pos.exit_noquote)
+            if res.qty > 0:
+                # book that order under its own reason; a runner left over keeps the reason it is due for
+                keep = (pos.exit_why, pos.exit_his_price)
+                out = self._book_sale(pos, qty, row, his_price, order_why or why, q, res)
+                if pos.exit_wanted and any(p is pos for p in self.positions):
+                    pos.exit_why, pos.exit_his_price = keep
+                    self.save_state()
+                return out
+            res = None                         # it ended with nothing filled: a fresh attempt below...
+            # ...unless contracts left the account meanwhile (e.g. you cancelled it and sold by hand): never sell the
+            # runner on top of them. An empty or failed reading changes nothing.
+            have = self.broker.still_held(pos.ticker, pos.exp, pos.strike, pos.cp)
+            if have and have < pos.qty_open:
+                self._shrink(pos, have)
+                if not pos.exit_wanted:
+                    return ("SHRUNK", pos.contract, have)
+                qty = min(qty, pos.exit_wanted, pos.qty_open)
+        if res is None:
+            res = self.broker.sell_once(pos.ticker, date.fromisoformat(pos.exp), pos.strike, pos.cp, qty, q,
+                                        pos.exit_attempts, on_order=self._track_order)
         # messages about real orders go out even while catching up on missed alerts (self._notify)
         if res.state == "unknown":
+            pos.exit_order, pos.exit_order_why = res.order_id, why.strip()
             self.halted = f"could not confirm the state of sell order {res.order_id} on {pos.contract}"
-            self._notify(f"!! SELL ORDER STATE UNKNOWN for {pos.contract} (order {res.order_id}). "
-                         f"New buys are halted. Check Robinhood now.")
+            self._notify(f"!! SELL ORDER STATE UNKNOWN for {pos.contract} (order {res.order_id}"
+                         + (f", {res.note}" if res.note else "") + "). New buys are halted. Check Robinhood now. "
+                         f"No other sell goes out for this contract until Robinhood confirms how that order ended - "
+                         f"don't sell by hand until it shows cancelled there.")
         if res.qty > 0:
-            price = res.price or (q or {}).get("bid") or 0.0
-            pnl = (price - pos.entry_price) * 100 * res.qty
-            his = (his_price - pos.his_entry) * 100 * res.qty if his_price else 0.0
-            pos.qty_open -= res.qty
-            pos.realized_pnl += pnl
-            pos.his_pnl_same_qty += his
-            pos.exit_wanted = max(0, qty - res.qty)
-            if pos.qty_open <= 0:
-                self.positions.remove(pos)
-            elif pos.exit_wanted == 0:
-                pos.exit_attempts = 0
-            self._after_live_pnl(pnl)
-            row.update(bid=(q or {}).get("bid"), ask=(q or {}).get("ask"), decision="SOLD", qty=res.qty,
-                       our_price=price, our_pnl=f"{pnl:.2f}", his_pnl_same_qty=f"{his:.2f}",
-                       reason=f"LIVE order {res.order_id}: {why.strip()}".strip(": "))
-            self.log(row)
-            self._notify(sell_message("SOLD", res.qty, pos.contract, price, pos.entry_price, his_price,
-                                      pos.his_entry, pnl, his, why, pos.qty_open))
-            self._runner_kept(pos)
-            return ("SOLD", pos.contract, res.qty, price, round(pnl, 2))
+            return self._book_sale(pos, qty, row, his_price, why, q, res)
         # not sold this time
         first = pos.exit_wanted == 0
         pos.exit_wanted = qty
         pos.exit_why = why.strip() or pos.exit_why
+        pos.exit_his_price = his_price or pos.exit_his_price
         if res.state == "failed":
             # Robinhood refused the order, so it was never open. See whether we still hold the contract
             # (it may have been sold by hand); if we do, retry more slowly and without lowering the price.
@@ -1721,22 +1825,99 @@ class Engine:
                 return self._drop(pos, row, f"Robinhood refused the sell twice ({res.note or res.state}) and no "
                                             f"longer shows this position")
             if have and have < pos.qty_open:
-                pos.qty_open = have
-                pos.exit_wanted = min(qty, have)
+                self._shrink(pos, have)
+                if not pos.exit_wanted:
+                    return ("SHRUNK", pos.contract, have)
             pos.exit_refused += 1
         else:
             pos.exit_refused = 0
-            if res.state != "no_quote":
+            if res.state == "no_quote":
+                pos.exit_noquote += 1              # counted for messages; the price isn't stepped down
+            else:
                 pos.exit_attempts += 1
         self.save_state()
-        n = pos.exit_attempts + pos.exit_refused
-        if first or n in (3, 6) or n % 10 == 0:
+        n = pos.exit_attempts + pos.exit_refused + pos.exit_noquote
+        if first or n in (3, 6) or (n and n % 10 == 0):
             row.update(decision="SELL PENDING", qty=qty,
                        reason=f"attempt {n}: {res.note or res.state}; will keep retrying")
             self.log(row)
-            self._notify(f"!! NOT SOLD YET: {pos.contract} (attempt {n}: {res.note or res.state}). "
-                         f"Retrying. If this repeats, sell it by hand in Robinhood.")
+            if res.state != "unknown":             # an unconfirmed order has its own message: nothing is retried
+                some = qty < pos.qty_open
+                self._notify(f"!! NOT SOLD YET: {f'{qty} of your {pos.qty_open} ' if some else ''}{pos.contract} "
+                             f"(attempt {n}: {res.note or res.state}). Retrying. If this repeats, "
+                             + (f"sell {qty} by hand in Robinhood - only {qty}: the bot keeps the other."
+                                if some else "sell it by hand in Robinhood."))
         return ("SELL PENDING", pos.contract, n)
+
+    def _book_sale(self, pos, qty, row, his_price, why, q, res):
+        """Book a (partly) filled real sell: position, pot, log, the SOLD card and, for a runner, what happens next."""
+        price = res.price or (q or {}).get("bid") or 0.0
+        pnl = (price - pos.entry_price) * 100 * res.qty
+        his = (his_price - pos.his_entry) * 100 * res.qty if his_price else 0.0
+        pos.qty_open -= res.qty
+        pos.realized_pnl += pnl
+        pos.his_pnl_same_qty += his
+        pos.exit_wanted = max(0, qty - res.qty)
+        if pos.exit_wanted:                 # partly filled: the rest is retried, for the same reason
+            pos.exit_why = why.strip() or pos.exit_why
+            pos.exit_his_price = his_price or pos.exit_his_price
+        else:
+            pos.exit_why, pos.exit_his_price = "", 0.0
+        if pos.qty_open <= 0:
+            self.positions.remove(pos)
+        elif pos.exit_wanted == 0:
+            pos.exit_attempts = pos.exit_refused = pos.exit_noquote = 0
+        self._after_live_pnl(pnl)
+        row.update(bid=(q or {}).get("bid"), ask=(q or {}).get("ask"), decision="SOLD", qty=res.qty,
+                   our_price=price, our_pnl=f"{pnl:.2f}", his_pnl_same_qty=f"{his:.2f}",
+                   reason=f"LIVE order {res.order_id}: {why.strip()}".strip(": "))
+        self.log(row)
+        self._notify(sell_message("SOLD", res.qty, pos.contract, price, pos.entry_price, his_price,
+                                  pos.his_entry, pnl, his, why, pos.qty_open))
+        self._runner_kept(pos, q)
+        return ("SOLD", pos.contract, res.qty, price, round(pnl, 2))
+
+    def _check_unknown_sell(self, pos):
+        """Look up a sell order whose final state we couldn't confirm. Returns None while it may still fill
+        (and asks Robinhood to cancel it again), else an OrderResult: filled (to be booked) or ended unfilled."""
+        oid = pos.exit_order
+        info = self.broker.order_info(oid)
+        st = info.get("state")
+        got, avg = Broker.fill_of(info)
+        if st == "filled" or (st in Broker.BAD and got > 0):
+            res = OrderResult("filled", got or min(pos.exit_wanted, pos.qty_open) or 1, avg, oid)
+        elif st in Broker.BAD:
+            res = OrderResult("cancelled", 0, 0.0, oid, note=f"earlier order ended {st}")
+        else:
+            try:
+                self.broker.api.cancel(oid)
+            except Exception as e:
+                print(f"cancel call failed ({oid}): {e}")
+            return None
+        pos.exit_order, pos.exit_order_why = "", ""
+        self._track_order(oid, False)
+        self._notify(f"Sell order {oid} on {pos.contract} is now confirmed: {st}"
+                     + (f", {res.qty} filled" if res.qty else ", nothing filled") + "."
+                     + (" New buys stay halted until you restart the bot." if self.halted else ""))
+        return res
+
+    def _shrink(self, pos, have, tell=True):
+        """Robinhood shows fewer of this contract than the bot thinks (sold by hand, or a fill the bot missed).
+        Lower our count, and what is still to be sold by the same number, so the bot never sells more than was
+        due - e.g. the runner when only the first contract was. Returns how many were gone."""
+        gone = pos.qty_open - have
+        pos.qty_open = have
+        pos.exit_wanted = max(0, pos.exit_wanted - gone)
+        if not pos.exit_wanted:
+            pos.exit_attempts = pos.exit_refused = pos.exit_noquote = 0
+            pos.exit_why, pos.exit_his_price = "", 0.0
+        self.save_state()
+        if tell:
+            self._notify(f"!! {pos.contract}: Robinhood shows {have} left, the bot had {have + gone} - {gone} sold "
+                         f"outside the bot (by hand?), not counted in the project pot."
+                         + (f" Still selling {pos.exit_wanted}." if pos.exit_wanted else " Nothing more to sell now."))
+            self._runner_kept(pos)
+        return gone
 
     def _drop(self, pos, row, why):
         """Take a real position off the bot's books without a sale of ours (sold by hand, say)."""
@@ -1760,8 +1941,18 @@ class Engine:
                 if last and (now - last).total_seconds() < wait:
                     continue
                 self._exit_tried[pos.contract] = now
+                if not pos.exit_order:
+                    # The first failed attempt already tells the user they may sell by hand. If Robinhood now shows
+                    # fewer, don't sell what is left on top of it (it would be the runner). An empty or failed
+                    # reading changes nothing.
+                    have = self.broker.still_held(pos.ticker, pos.exp, pos.strike, pos.cp)
+                    if have and have < pos.qty_open:
+                        self._shrink(pos, have)
+                        if not pos.exit_wanted:
+                            continue
                 row = {"alert_time": "", "raw": "(retrying exit)", "action": "SELL_RETRY", "contract": pos.contract}
-                self._close(pos, min(pos.exit_wanted, pos.qty_open), row, his_price=None, why=pos.exit_why)
+                self._close(pos, min(pos.exit_wanted, pos.qty_open), row, his_price=pos.exit_his_price or None,
+                            why=pos.exit_why)
 
     def check_stops(self, now):
         """Automatic exits, checked every ~10 s on each open position:
@@ -1833,7 +2024,7 @@ class Engine:
         self.log(row)
         self.notify(sell_message("WOULD SELL", qty, pos.contract, bid, pos.entry_price, his_price,
                                  pos.his_entry, pnl, his, why, pos.qty_open))
-        self._runner_kept(pos)
+        self._runner_kept(pos, q)
         return ("WOULD SELL", pos.contract, qty, bid, round(pnl, 2))
 
     # ---- things that run on a timer ----------------------------------------
@@ -1844,15 +2035,21 @@ class Engine:
     def _tick(self):
         now = self.now()
         self.retry_exits(now)
-        self.check_stops(now)
-        self._poll_watches(now)
+        # His sells posted while the market was closed go first: they came before anything the open can trigger
+        # (e.g. the take-profit), so "his sell came first" holds for a runner.
         if self.market_open(now) and self.pending_sells:
             queued, self.pending_sells = self.pending_sells, []
             self.save_state()
             for item in queued:
-                alert, _ = parse_line(item["text"], now.date())
+                alert, _ = parse_line(item["text"], datetime.fromisoformat(item["alert_time"]).date())
+                if alert and item.get("contract"):           # the contract it was matched to (a typo fixed)
+                    tk, k, cp, ex = item["contract"]
+                    alert = replace(alert, ticker=tk, strike=float(k), cp=cp, exp=date.fromisoformat(ex))
                 if alert:
-                    self.on_sell(alert, datetime.fromisoformat(item["alert_time"]), from_queue=True)
+                    self.on_sell(alert, datetime.fromisoformat(item["alert_time"]), from_queue=True,
+                                 fix_note=item.get("fix_note", ""))
+        self.check_stops(now)
+        self._poll_watches(now)
         # safety close on expiry day
         if self.market_open(now) and now.time() >= self.s.expiry_close_time:
             for pos in list(self.positions):
@@ -2180,6 +2377,10 @@ class Broker:
             state = info.get("state")
         got, avg = self.fill_of(info)
         self._log(side.upper(), label, qty, price, oid, state, avg or "", "")
+        if side == "sell" and got > 0 and state != "filled" and state not in self.BAD:
+            # partly filled and the cancel didn't land: the rest may still fill - treat it as unconfirmed, so no
+            # second sell goes out on top of it (it stays in inflight; the full fill is booked once it ends)
+            return OrderResult("unknown", 0, 0.0, oid, note=f"{got} filled, the rest still open ({state})")
         if state == "filled" or got > 0:
             if on_order:
                 on_order(oid, False)
@@ -2229,9 +2430,13 @@ class Broker:
         mine = {(p.ticker, p.exp, p.strike, p.cp): p for p in positions if p.real and p.qty_open > 0}
         for key, p in mine.items():
             have = theirs.get(key, 0)
-            if have < p.qty_open:
+            if have < p.qty_open and p.exit_order:
+                msgs.append(f"Robinhood shows {have} of {p.qty_open}x {p.contract} - waiting for sell order "
+                            f"{p.exit_order} to be confirmed before changing the bot's books")
+            elif have < p.qty_open:
                 msgs.append(f"bot thought it held {p.qty_open}x {p.contract} but Robinhood shows {have} - "
-                            f"position dropped from the bot's books")
+                            + ("position dropped from the bot's books" if have <= 0 else
+                               f"reduced to {have} on the bot's books (the difference is not counted in the pot)"))
         for key, q in theirs.items():
             if key not in mine:
                 t, e, k, c = key
@@ -2416,12 +2621,10 @@ async def run():
 
     # ---- catch up on anything posted while the bot was off ----------------
     async def catch_up():
-        try:
-            try:
-                entity = await client.get_entity(chat_id)
-            except Exception:
-                await client.get_dialogs()
-                entity = await client.get_entity(chat_id)
+        # The lock covers reading AND handling the missed messages, so a live alert arriving meanwhile waits and is
+        # handled after them, in order - his sell can never be handled before the buy it follows.
+        saved = list(engine.watching)              # watches saved before this start
+        async with rh_lock:
             kw = {"reverse": True, "limit": 1000}
             if engine.last_msg_id:
                 kw["min_id"] = engine.last_msg_id
@@ -2429,15 +2632,36 @@ async def run():
             else:
                 kw["offset_date"] = datetime.now(ET) - timedelta(days=s.backfill_days)
                 what = f"from the last {s.backfill_days:g} days (first run)"
-            msgs = [m async for m in client.iter_messages(entity, **kw) if m.raw_text]
-        except Exception as e:
-            notify(f"!! Couldn't read missed messages ({e}). Live alerts still work.")
-            return
-        if not msgs:
-            print("Catch-up: nothing missed.")
-            return
-        print(f"Catch-up: reading {len(msgs)} messages {what}...")
-        async with rh_lock:
+
+            async def fetch():
+                try:
+                    entity = await client.get_entity(chat_id)
+                except Exception:
+                    await client.get_dialogs()
+                    entity = await client.get_entity(chat_id)
+                return [m async for m in client.iter_messages(entity, **kw) if m.raw_text]
+
+            try:
+                # a time limit: live alerts wait for this lock, so a Telegram call that never answers must not
+                # block them for good
+                try:
+                    msgs = await asyncio.wait_for(fetch(), CATCHUP_TIMEOUT_SEC)
+                except asyncio.TimeoutError:
+                    raise TimeoutError(f"no answer from Telegram in {CATCHUP_TIMEOUT_SEC:g} s") from None
+            except Exception as e:
+                # His sells posted while the bot was off are unknown: a saved watch must not buy blind.
+                with engine.lock:
+                    for k in saved:
+                        engine._end_watch(k, "couldn't read missed messages - his sells while the bot was off "
+                                             "are unknown")
+                notify(f"!! Couldn't read missed messages ({e}). Live alerts still work"
+                       + (f"; {len(saved)} saved watch(es) stopped" if saved else "")
+                       + ". Check his sells on your open positions by hand.")
+                return
+            if not msgs:
+                print("Catch-up: nothing missed.")
+                return
+            print(f"Catch-up: reading {len(msgs)} messages {what}...")
             engine.quiet = True
             try:
                 for m in msgs:
@@ -2593,12 +2817,15 @@ def selftest():
     selftest_failures()
     selftest_runner()
     selftest_first_sell()
+    selftest_review_fixes()
+    print("\n  ALL SELF-TESTS PASSED")
 
 
 class _FakeAPI:
     """Stands in for Robinhood's order system. Each placed order follows the next scripted behaviour:
     fill | nofill (stays open until cancelled) | fill_on_cancel (fills just as we cancel) |
-    fill_one (1 contract fills, the rest is cancelled) | stuck (cancel never lands) |
+    fill_one (1 contract fills, the rest is cancelled) | fill_one_stuck (1 fills, the cancel never lands) |
+    stuck (cancel never lands) |
     refuse (Robinhood rejects the request)."""
 
     def __init__(self):
@@ -2624,7 +2851,7 @@ class _FakeAPI:
         self.sizes.append((side, qty))
         if beh == "fill":
             self._fill(oid)
-        elif beh == "fill_one":                  # only 1 contract fills; the rest stays open until cancelled
+        elif beh in ("fill_one", "fill_one_stuck"):   # only 1 contract fills; the rest stays open
             self._fill(oid, 1)
             self.orders[oid]["state"] = "partially_filled"
         return {"id": oid, "state": "unconfirmed"}
@@ -2642,7 +2869,7 @@ class _FakeAPI:
         o = self.orders[oid]
         if o["beh"] == "fill_on_cancel":
             self._fill(oid)
-        elif o["beh"] != "stuck":
+        elif o["beh"] not in ("stuck", "fill_one_stuck"):
             o["state"] = "cancelled"
 
     def buying_power(self):
@@ -3553,6 +3780,356 @@ def selftest_first_sell():
     check("WATCH_MIN_SHORT=0: 1-3 days out not watched", r[0][0] == "SKIP", str(r[0]))
     s.watch_min_short = 15
     print("\n  all first-sell / start-up / watch checks passed")
+
+
+def selftest_review_fixes():
+    """The problems a code review found in the first-sell / runner / start-up changes, each replayed and checked."""
+    import tempfile
+    print("\n\n========== review fixes: unconfirmed sells, after-hours sells, sold by hand, start-up checks ==========")
+    tmp = tempfile.mkdtemp()
+    clock = {"t": datetime(2026, 10, 13, 10, 0, 0, tzinfo=ET)}          # a Tuesday
+    book, notes = {}, []
+    s = Settings()
+    s.keep_runner, s.max_single_contract_cost, s.take_profit_pct, s.runner_sell_pct = True, 500, 40, 50
+    s.max_open_positions, s.max_buys_per_day, s.max_deployed, s.project_capital = 30, 80, 20000, 20000
+    s.disaster_stop_pct, s.watch_min, s.watch_min_short, s.watch_min_dte = 50, 60, 15, 3
+
+    def quotes(ticker, exp, strike, cp):
+        b = book.get(ticker)
+        return {"bid": b[0], "ask": b[1], "mark": round((b[0] + b[1]) / 2, 3)} if b else None
+
+    def qmany(items):
+        return {t.key: quotes(t.ticker, None, None, None) for t in items if book.get(t.ticker)}
+
+    api = _FakeAPI()
+    api.bp = 50000.0
+
+    def build(state="s.json"):
+        brk = Broker(api, s, lambda x: None, orders_csv=os.path.join(tmp, "orders.csv"), sleep=lambda x: None,
+                     now=lambda: clock["t"])
+        tr = Tracker(s, qmany, lambda tk: {}, now=lambda: clock["t"], path_csv=os.path.join(tmp, "paths.csv"),
+                     save=lambda: None, notify=lambda x: None)
+        return Engine(s, quotes, lambda x: notes.append(x), now=lambda: clock["t"],
+                      log_path=os.path.join(tmp, "log.csv"), state_path=os.path.join(tmp, state),
+                      broker=brk, tracker=tr, stop_file=os.path.join(tmp, "STOP_TRADING"))
+
+    eng = build()
+
+    def feed(text, age=2, source="live"):
+        clock["t"] += timedelta(seconds=3)
+        notes.clear()
+        return eng.handle_message(text, clock["t"] - timedelta(seconds=age), None, source)
+
+    def tick(sec=11):
+        clock["t"] += timedelta(seconds=sec)
+        notes.clear()
+        eng.tick()
+
+    def check(label, cond, detail=""):
+        print(f"  {'PASS' if cond else 'FAIL'}  {label}  {detail}")
+        assert cond, label
+
+    def pos(ticker, e=None):
+        return next((p for p in (e or eng).positions if p.ticker == ticker and p.qty_open > 0), None)
+
+    def said(word):
+        return any(word in n for n in notes)
+
+    def sells():
+        return [x for x in api.placed if x[0] == "sell"]
+
+    # --- 1. a sell whose state can't be confirmed: never a second sell on top of it -------------------------
+    book["UKA"] = (1.95, 2.00)
+    feed("BOUGHT UKA 100C 10/23 2.0")                       # 2 at 2.05
+    book["UKA"] = (2.95, 3.00)                              # +44%: take-profit sells 1
+    api.script = ["stuck"]                                  # its cancel never lands
+    tick()
+    stuck = f"o{api.n}"
+    check("take-profit sell can't be confirmed: buys halted, order remembered", eng.halted and pos("UKA").exit_order == stuck
+          and said("STATE UNKNOWN"), str(notes))
+    n = len(sells())
+    tick(5)
+    tick(5)
+    check("...no second sell while it might still fill", len(sells()) == n and pos("UKA").qty_open == 2, str(sells()))
+    api._fill(stuck)                                        # Robinhood then fills it
+    tick(5)
+    check("...when it turns out filled, it is booked: 1 of 2 sold, runner kept, no extra order",
+          pos("UKA").qty_open == 1 and pos("UKA").runner_left and len(sells()) == n and not pos("UKA").exit_order
+          and said("now confirmed: filled") and said("RUNNER kept"), str(notes))
+    book["UKB"] = (1.95, 2.00)
+    s_halt, eng.halted = eng.halted, ""
+    feed("BOUGHT UKB 100C 10/23 2.0")
+    book["UKB"] = (2.95, 3.00)
+    api.script = ["stuck"]
+    tick()
+    stuck = f"o{api.n}"
+    api.orders[stuck]["state"] = "cancelled"                # it ends unfilled after all
+    tick(5)
+    check("...when it turns out cancelled, a fresh sell goes out", pos("UKB").qty_open == 1 and len(sells()) == n + 2,
+          str(sells()))
+    eng.halted = ""
+
+    # --- 2. his sell posted after the close comes before the take-profit at the next open -------------------
+    book["AHA"] = (1.95, 2.00)
+    clock["t"] = datetime(2026, 10, 13, 15, 0, 0, tzinfo=ET)
+    feed("BOUGHT AHA 100C 10/23 2.0")
+    clock["t"] = datetime(2026, 10, 13, 16, 30, 0, tzinfo=ET)
+    r = feed("SOLD 1/4 AHA 100C 10/23 2.1")
+    check("his sell after the close is queued", r[0][0] == "QUEUED", str(r[0]))
+    book["AHA"] = (3.20, 3.30)                              # opens +56%
+    clock["t"] = datetime(2026, 10, 14, 9, 30, 20, tzinfo=ET)
+    eng.tick()
+    check("at the open his queued sell counts first: 1 of 2 sold as his, runner kept",
+          pos("AHA").qty_open == 1 and pos("AHA").first_out == "his", str(pos("AHA")))
+    r = feed("SOLD 1/4 AHA 100C 10/23 3.3")
+    check("...so his next partial sell (at +56%) keeps the runner", r[0][0] == "HOLD", str(r[0]))
+
+    # --- 3. +50% check while the take-profit sale is still being retried ---------------------------------------
+    clock["t"] = datetime(2026, 10, 14, 10, 0, 0, tzinfo=ET)
+    book["PBA"] = (1.95, 2.00)
+    feed("BOUGHT PBA 100C 10/23 2.0")
+    book["PBA"] = (2.95, 3.00)
+    api.script = ["nofill"]
+    tick()
+    book["PBA"] = (3.30, 3.40)                              # +61%
+    r = feed("SOLD 1/4 PBA 100C 10/23 3.35")
+    check("his sell at +61% while the take-profit is being retried: both to be sold", r[0][0] == "PENDING"
+          and pos("PBA").exit_wanted == 2, str(pos("PBA")))
+    tick(5)
+    with open(eng.log_path, encoding="utf-8-sig") as f:
+        last = [x for x in csv.DictReader(f) if x["contract"] == "PBA 100C 10/23" and x["decision"] == "SOLD"][-1]
+    check("...and the retry sells both, logging why", pos("PBA") is None and last["qty"] == "2"
+          and "runner sold too" in last["reason"], last["reason"])
+
+    # --- 4. contracts sold outside the bot: never sell the runner on top of them -------------------------------
+    book["HBA"] = (1.95, 2.00)
+    feed("BOUGHT HBA 100C 10/23 2.0")
+    book["HBA"] = (2.40, 2.45)
+    api.script = ["nofill"] * 6
+    feed("SOLD 1/4 HBA 100C 10/23 2.45")                    # his first sell: 1 of 2, not filling
+    for _ in range(3):
+        tick(5)
+    check("first-contract sell retried 3+ times, user warned to sell only 1 by hand",
+          pos("HBA").exit_attempts >= 3, str(pos("HBA")))
+    api.held = [("HBA", "2026-10-23", 100.0, "C", 1)]       # the user sold 1 in the app
+    api.script = []
+    n = len(sells())
+    tick(5)
+    check("Robinhood now shows 1: nothing more is sold, the runner is kept", len(sells()) == n
+          and pos("HBA").qty_open == 1 and not pos("HBA").exit_wanted and said("sold outside the bot"), str(notes))
+    api.held = []
+    st = os.path.join(tmp, "restart.json")
+    with open(st, "w", encoding="utf-8") as f:
+        json.dump({"positions": [{"ticker": "RSA", "strike": 100.0, "cp": "C", "exp": "2026-10-23", "qty_orig": 2,
+                                  "qty_open": 2, "entry_price": 2.05, "his_entry": 2.0, "opened_at": "2026-10-13T10:00:00",
+                                  "real": True, "runner": True, "exit_wanted": 1, "exit_attempts": 2,
+                                  "first_out": "his"}]}, f)
+    api.held = [("RSA", "2026-10-23", 100.0, "C", 1)]       # its first-contract sale filled while the bot was down
+    eng2 = build("restart.json")
+    msgs = eng2.startup_live()
+    check("restart: Robinhood shows 1 of 2 -> reduced to 1, nothing left to sell, runner kept",
+          pos("RSA", eng2).qty_open == 1 and not pos("RSA", eng2).exit_wanted
+          and any("reduced to 1" in m for m in msgs), str(msgs))
+    api.held = []
+
+    # --- 5. a typo-corrected exit queued after the close is applied at the open -------------------------------
+    book["TYQ"] = (2.40, 2.50)
+    clock["t"] = datetime(2026, 10, 14, 15, 0, 0, tzinfo=ET)
+    feed("BOUGHT TYQ 100C 10/23 2.45")
+    clock["t"] = datetime(2026, 10, 14, 16, 30, 0, tzinfo=ET)
+    r = feed("ALL OUT TYQ 105C 10/23 2.45")                 # strike typo, fits 100C's quote
+    check("typo exit after the close: matched and queued", r[0][0] == "QUEUED", str(r[0]))
+    clock["t"] = datetime(2026, 10, 15, 9, 30, 20, tzinfo=ET)
+    eng.tick()
+    check("...and carried out at the open (both sold)", pos("TYQ") is None, str(notes))
+
+    # --- 7. a start-up alert gets one second look, like a live alert -------------------------------------------
+    clock["t"] = datetime(2026, 10, 15, 10, 0, 0, tzinfo=ET)
+    book["ZDA"] = (2.90, 3.00)                              # his 2.5 -> cap 2.75
+    r = feed("BOUGHT ZDA 100C 10/15 2.5", age=6, source="catch-up")      # same day
+    tick(16)
+    check("same-day start-up alert above the cap: skipped at the second look, not watched",
+          not eng.watching and pos("ZDA") is None, str(notes))
+    book["ZDA"] = (2.10, 2.20)
+    tick()
+    check("...and not bought when the price dips later", pos("ZDA") is None)
+    book["ZSB"] = (1.50, 2.05)                              # spread 31%
+    feed("BOUGHT ZSB 100C 10/15 2.0", age=6, source="catch-up")
+    tick(16)
+    rec = eng.watching.get(contract_key("ZSB", 100.0, "C", date(2026, 10, 15)), {})
+    check("start-up alert with a wide spread: the normal 60 s spread re-check", rec.get("kind") == "spread", str(rec))
+    eng._end_watch(contract_key("ZSB", 100.0, "C", date(2026, 10, 15)), "test cleanup")
+
+    # --- 8. a mistyped sell right behind a start-up alert cancels it --------------------------------------------
+    book["LRX"] = (4.20, 4.30)
+    feed("BOUGHT LRX 300C 10/17 4.39", age=8, source="catch-up")
+    feed("SOLD 1/2 LRX 305C 10/17 4.6", age=4, source="catch-up")       # strike typo: can't be confirmed
+    tick(16)
+    check("start-up alert + mistyped sell of his: not bought", pos("LRX") is None and not eng.watching, str(notes))
+
+    # --- 9-13. messages ------------------------------------------------------------------------------------------
+    book["MSA"] = (1.95, 2.00)
+    feed("BOUGHT MSA 100C 10/23 2.0")
+    check("runner buy card states the rule", said("his first sell or +40%, whichever first"), str(notes))
+    book["MSA"] = (1.70, 1.80)                              # below our 2.05
+    feed("SOLD 1/2 MSA 100C 10/23 1.75")
+    check("his first sell at a loss: says the runner goes at the next check, not 'kept'",
+          said("already at or below your buy price") and not said("RUNNER kept"), str(notes))
+    tick()
+    book["MSB"] = (1.95, 2.00)
+    feed("BOUGHT MSB 100C 10/23 2.0")
+    book["MSB"] = (2.95, 3.00)
+    api.script = ["nofill"]
+    tick()
+    feed("ALL OUT MSB 100C 10/23 3.05")
+    tick(5)
+    card = " ".join(notes)
+    check("his ALL OUT during a take-profit retry: card shows his sale, not 'has not sold'",
+          pos("MSB") is None and "has not sold" not in card and "3.05" in card, card[:300])
+    book["MSC"] = (1.95, 2.00)
+    feed("BOUGHT MSC 100C 10/23 2.0")
+    book["MSC"] = (2.95, 3.00)
+    tick()
+    del book["MSC"]                                         # no quote at his sell
+    r = feed("SOLD 1/4 MSC 100C 10/23 3.1")
+    check("HOLD with no quote says so instead of claiming we're under +50%", r[0][0] == "HOLD"
+          and said("no quote right now"), str(notes))
+    book["CKA"] = (1.95, 2.00)
+    feed("BOUGHT CKA 100C 10/23 2.0")
+    eng.quiet = True                                        # catching up on missed alerts
+    feed("SOLD 1/2 CKA 105C 10/23 2.5", age=600, source="catch-up")
+    eng.quiet = False
+    check("a CHECK about a contract we hold is sent even while catching up", said("!! CHECK"), str(notes))
+
+    # --- second review: what the fixes themselves left open ----------------------------------------------------
+    clock["t"] = datetime(2026, 10, 16, 10, 0, 0, tzinfo=ET)            # a Friday
+    eng.halted = ""
+    book["CHA"] = (1.95, 2.00)
+    feed("BOUGHT CHA 100C 10/30 2.0")
+    book["CHA"] = (2.95, 3.00)
+    api.script = ["stuck"]
+    tick()
+    stuck = f"o{api.n}"
+    check("unconfirmed sell: says don't sell by hand until it shows cancelled, no 'sell 1 by hand' advice",
+          said("STATE UNKNOWN") and said("don't sell by hand") and not said("NOT SOLD YET"), str(notes))
+    api.orders[stuck]["state"] = "cancelled"                # you cancel it in the app...
+    api.held = [("CHA", "2026-10-30", 100.0, "C", 1)]       # ...and sell 1 by hand
+    n = len(sells())
+    tick(5)
+    check("...it ends cancelled and Robinhood shows 1: nothing more sold, runner kept", len(sells()) == n
+          and pos("CHA").qty_open == 1 and not pos("CHA").exit_wanted, str(notes))
+    api.held = []
+    eng.halted = ""
+
+    book["HSA"] = (1.95, 2.00)
+    feed("BOUGHT HSA 100C 10/30 2.0")
+    book["HSA"] = (2.40, 2.45)
+    api.script = ["nofill"]
+    feed("SOLD 1/4 HSA 100C 10/30 2.45")                    # his first sell: 1 of 2, the first try doesn't fill
+    check("first failed try already says sell 1 by hand", said("NOT SOLD YET: 1 of your 2"), str(notes))
+    api.held = [("HSA", "2026-10-30", 100.0, "C", 1)]       # you do, right away
+    n = len(sells())
+    tick(5)
+    check("...the very next retry sees it: nothing more sold, runner kept", len(sells()) == n
+          and pos("HSA").qty_open == 1 and not pos("HSA").exit_wanted, str(notes))
+    api.held = []
+
+    book["NQA"] = (1.95, 2.00)
+    feed("BOUGHT NQA 100C 10/30 2.0")
+    del book["NQA"]                                         # no quotes
+    feed("SOLD 1/4 NQA 100C 10/30 2.4")
+    spam = 0
+    for _ in range(12):
+        tick(5)
+        spam += sum("NOT SOLD YET" in x for x in notes)
+    check("no quote: NOT SOLD YET is not sent on every lap", spam <= 3, f"{spam} in 12 laps")
+    api.held = [("NQA", "2026-10-30", 100.0, "C", 1)]       # you sell 1 by hand during the outage
+    tick(5)
+    book["NQA"] = (2.40, 2.45)                              # quotes are back
+    n = len(sells())
+    tick(5)
+    check("...and the runner is not sold when quotes return", len(sells()) == n and pos("NQA").qty_open == 1,
+          str(notes))
+    api.held = []
+
+    stuck = "ox1"
+    api.orders[stuck] = {"id": stuck, "state": "queued", "beh": "stuck", "price": 2.95, "qty": 1,
+                         "processed_quantity": "0", "legs": [{"executions": []}]}
+    with open(os.path.join(tmp, "unknown.json"), "w", encoding="utf-8") as f:
+        json.dump({"inflight": [stuck], "positions": [
+            {"ticker": "RUA", "strike": 100.0, "cp": "C", "exp": "2026-10-30", "qty_orig": 2, "qty_open": 2,
+             "entry_price": 2.05, "his_entry": 2.0, "opened_at": "2026-10-16T10:00:00", "real": True, "runner": True,
+             "exit_wanted": 1, "exit_attempts": 1, "first_out": "target", "exit_order": stuck,
+             "exit_order_why": "take profit: bid 2.95 is +44% over our 2.05; 1 of 2 sold, runner kept"}]}, f)
+    real_info = api.order_info
+
+    def no_answer(oid):
+        if oid == stuck:
+            raise RuntimeError("no answer")
+        return real_info(oid)
+    api.order_info = no_answer
+    api.held = [("RUA", "2026-10-30", 100.0, "C", 1)]       # the order filled while the bot was down
+    eng3 = build("unknown.json")
+    notes.clear()
+    msgs = eng3.startup_live()
+    check("restart, the order can't be looked up, Robinhood shows 1 of 2: books kept until it is confirmed",
+          pos("RUA", eng3).qty_open == 2 and pos("RUA", eng3).exit_order == stuck
+          and any("waiting for sell order" in m for m in msgs), str(msgs))
+    del api.order_info                                      # Robinhood answers again: it filled
+    api._fill(stuck)
+    clock["t"] += timedelta(seconds=5)
+    notes.clear()
+    eng3.tick()
+    check("...then it is booked once, runner kept, no 'restart to resume buying' (buys aren't halted)",
+          pos("RUA", eng3).qty_open == 1 and pos("RUA", eng3).runner_left and not pos("RUA", eng3).exit_order
+          and said("now confirmed: filled") and not said("stay halted"), str(notes))
+    book["RUA"] = (2.95, 3.00)
+    n = len(sells())
+    r = eng3.handle_message("ALL OUT RUA 100C 10/30 3.0", clock["t"] - timedelta(seconds=1))
+    check("...and the runner is still managed: his ALL OUT sells it", r[0][0] == "SOLD" and len(sells()) == n + 1,
+          str(r[0]))
+    api.held = []
+
+    book["PFA"] = (1.95, 2.00)
+    feed("BOUGHT PFA 100C 10/30 2.0")
+    book["PFA"] = (2.40, 2.45)
+    api.script = ["fill_one_stuck"]
+    feed("ALL OUT PFA 100C 10/30 2.45")                     # sell 2: 1 fills, the cancel of the rest never lands
+    po = f"o{api.n}"
+    check("sell of 2 partly filled, cancel not landed: unconfirmed, no second sell",
+          pos("PFA").qty_open == 2 and pos("PFA").exit_order == po, str(notes))
+    n = len(sells())
+    feed("SOLD 1/4 PFA 100C 10/30 2.5")
+    check("...his sell meanwhile: you're told nothing more is sold until it's confirmed", said("still unconfirmed"),
+          str(notes))
+    tick(5)
+    check("...nothing more sent while it's open", len(sells()) == n)
+    api.orders[po]["state"] = "cancelled"                   # it ends: 1 filled, 1 cancelled
+    tick(5)
+    tick(5)
+    check("...when it ends, the 1 filled is booked and the other is sold", pos("PFA") is None and len(sells()) == n + 1,
+          str(notes))
+    eng.halted = ""
+
+    book["LNF"] = (1.95, 2.00)
+    buys = len([x for x in api.placed if x[0] == "buy"])
+    api.script = ["nofill"]
+    feed("BOUGHT LNF 100C 10/16 2.0", age=6, source="catch-up")            # same day, 6 s old
+    for sec in (16, 11, 11, 11):
+        tick(sec)
+    check("start-up alert whose buy doesn't fill: exactly 1 buy order, then done",
+          len([x for x in api.placed if x[0] == "buy"]) == buys + 1 and not any(k.startswith("LNF") for k in eng.watching),
+          str(api.placed[-3:]))
+
+    book["OWA"] = (1.95, 2.00)
+    feed("BOUGHT OWA 100C 10/30 2.0")
+    feed("BOUGHT OWA 110C 10/30 2.0")                       # skipped: one position per stock
+    feed("SOLD 1/2 OWA 110C 10/30 2.5")
+    check("he sells his other strike that we skipped: a quiet note, not 'Typo? decide by hand'",
+          said("his own contract") and not said("!! CHECK") and pos("OWA").qty_open == 2, str(notes))
+    card = sell_message("SOLD", 1, "X 100C 10/30", 2.0, 2.05, 2.1, 2.0, -5.0, 10.0, "runner stop: mid 2 is back", 0)
+    check("a sell card with his price still shows our own reason", "Our exit: runner stop" in card, card)
+    print("\n  all review-fix checks passed")
 
 
 def selftest_live():
