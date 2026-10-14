@@ -54,15 +54,14 @@ Start it by about **9:15 AM**, from `D:\WorkSpace\sniper-bot` with the venv acti
 python .\sniper-bot\sniper_shadow.py
 ```
 - **Robinhood login:** it reuses the saved session. It only asks for your email and password if the session has expired (about once a day), and you may need to approve in the Robinhood app.
-- **Catch-up:** on startup it reads every message posted while it was off, then starts following his open contracts. The first run reads the last 7 days.
+- **Catch-up:** on startup it reads every message posted while it was off, then starts following his open contracts. The first run reads the last 7 days. A buy posted only moments before (within the late-entry limits in `LIVE.md`) is still bought after a second look; older ones are skipped as missed.
 - **Leave it running until after 4:05 PM.** A summary posts to Saved Messages, then press Ctrl+C. Restart it the next morning.
 - **Keep the PC awake:** keep it plugged in with the lid open. In Settings → System → Power & battery, set both "turn off my screen" and "put my device to sleep" to Never when plugged in, and in Control Panel → Power Options → "Choose what closing the lid does", pick "Do nothing" when plugged in. The bot keeps the screen on while it runs (on laptops with Modern Standby, the screen timing out is what puts the PC to sleep), but closing the lid or a flat battery still sleeps it, and nothing protects an open position while it sleeps.
 - **Heartbeat:** every 5 minutes it prints an `alive` line showing each open position with its profit or loss, whether Telegram is connected and how many contracts it's tracking. For example `holding 1: 1x MU 1200C 10/16 -5.3% (-$20)`.
   - The % is at the **last traded price**, so it can differ from the Robinhood app, which uses the mid price.
   - `no trade today` means the contract hasn't traded yet today, so that price is from an earlier day.
   - `mid` means Robinhood had no last trade, so the mid price is used.
-  - `[lock +40%]` means the profit lock is on: it is sold on his exit, or if the bid falls back to +40%.
-  - The profit lock and the stops don't use this number: they still use the bid and the mid.
+  - The take-profit and the stops don't use this number: they still use the bid and the mid.
 
 ## What gets recorded
 - **runs/<date>/trades_log.csv:** every alert, with the time he posted it, the delay before the bot saw it, the expiry group (0DTE / short / swing), the real bid/ask, and what the bot would have done.
